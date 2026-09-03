@@ -38,7 +38,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from .routers import auth, incidents, constables, media, settings, websocket, police_stations, audit_logs, devices, recordings, commands, alerts
+from .routers import auth, incidents, constables, media, settings, websocket, police_stations, audit_logs, devices, recordings, commands, alerts, live_stream
 app.include_router(auth.router)
 app.include_router(incidents.router)
 app.include_router(constables.router)
@@ -51,6 +51,7 @@ app.include_router(devices.router)
 app.include_router(recordings.router)
 app.include_router(commands.router)
 app.include_router(alerts.router)
+app.include_router(live_stream.router)
 
 
 # ---------------------------------------------------------------------------

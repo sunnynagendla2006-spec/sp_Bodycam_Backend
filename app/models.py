@@ -471,6 +471,8 @@ class VideoChunk(Base):
 class RemoteCommandType(str, enum.Enum):
     start_recording = "start_recording"
     stop_recording = "stop_recording"
+    start_live_stream = "start_live_stream"
+    stop_live_stream = "stop_live_stream"
 
 
 class RemoteCommandStatus(str, enum.Enum):
@@ -496,3 +498,38 @@ class RemoteCommand(Base):
     executed_at = Column(DateTime(timezone=True), nullable=True)
     failure_reason = Column(String, nullable=True)
     result_payload = Column(JSON, nullable=True)
+
+
+# ===========================================================================
+# Live camera streaming (ephemeral only -- never stored/recorded). A
+# LiveStreamSession row is pure session metadata: who is streaming, on
+# which device, since when. The actual video never touches this database
+# or this backend process at all -- it flows entirely through the LiveKit
+# SFU, which this backend only issues short-lived join tokens for (see
+# app/routers/live_stream.py).
+# ===========================================================================
+
+class LiveStreamStatus(str, enum.Enum):
+    live = "live"
+    ended = "ended"
+
+
+class LiveStreamStartedBy(str, enum.Enum):
+    self = "self"
+    remote_command = "remote_command"
+
+
+class LiveStreamSession(Base):
+    __tablename__ = "live_stream_sessions"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    device_id = Column(UUID(as_uuid=True), ForeignKey("devices.id", ondelete="RESTRICT"), nullable=False, index=True)
+    constable_id = Column(UUID(as_uuid=True), ForeignKey("constables.id", ondelete="RESTRICT"), nullable=False, index=True)
+    room_name = Column(String, nullable=False)
+    status = Column(Enum(LiveStreamStatus), default=LiveStreamStatus.live, nullable=False, index=True)
+    started_by = Column(Enum(LiveStreamStartedBy), nullable=False)
+    # SET NULL: a command row's own lifecycle (ack/result) is independent
+    # of this session row's lifetime -- neither should be able to destroy
+    # the other.
+    triggering_command_id = Column(UUID(as_uuid=True), ForeignKey("remote_commands.id", ondelete="SET NULL"), nullable=True)
+    started_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    ended_at = Column(DateTime(timezone=True), nullable=True)

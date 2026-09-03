@@ -417,3 +417,25 @@ async def publish_generic_alert_event(alert: models.Alert, station_id: Optional[
     await manager.send_to_station(station_id, event)
     if alert.constable_id:
         await manager.send_to_constable(alert.constable_id, event)
+
+
+def _live_stream_summary(session: models.LiveStreamSession) -> dict:
+    return {
+        "session_id": str(session.id),
+        "device_id": str(session.device_id),
+        "constable_id": str(session.constable_id),
+        "room_name": session.room_name,
+        "started_by": session.started_by.value if session.started_by else None,
+    }
+
+
+async def publish_live_stream_started(session: models.LiveStreamSession, station_id: Optional[uuid.UUID]):
+    event = build_event("live_stream.started", _live_stream_summary(session))
+    await manager.send_to_control_room(event)
+    await manager.send_to_station(station_id, event)
+
+
+async def publish_live_stream_ended(session: models.LiveStreamSession, station_id: Optional[uuid.UUID]):
+    event = build_event("live_stream.ended", _live_stream_summary(session))
+    await manager.send_to_control_room(event)
+    await manager.send_to_station(station_id, event)

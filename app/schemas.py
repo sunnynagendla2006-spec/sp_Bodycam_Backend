@@ -2,7 +2,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from typing import Optional, List
 import uuid
 from datetime import datetime
-from .models import UserRole, UserStatus, ConstableStatus, IncidentStatus, MediaType, UploadStatus, AssignmentStatus, DeviceStatus, AlertType, AlertSeverity, AlertStatus, RecordingTriggerType, RecordingStatus, RemoteCommandType, RemoteCommandStatus
+from .models import UserRole, UserStatus, ConstableStatus, IncidentStatus, MediaType, UploadStatus, AssignmentStatus, DeviceStatus, AlertType, AlertSeverity, AlertStatus, RecordingTriggerType, RecordingStatus, RemoteCommandType, RemoteCommandStatus, LiveStreamStatus, LiveStreamStartedBy
 
 class UserBase(BaseModel):
     phone: str
@@ -478,3 +478,31 @@ class AlertResponse(BaseModel):
     resolved_at: Optional[datetime] = None
     created_at: datetime
     model_config = ConfigDict(from_attributes=True)
+
+# ---------------------------------------------------------------------------
+# Live camera streaming (ephemeral only -- see app/models.py::LiveStreamSession
+# and app/routers/live_stream.py).
+# ---------------------------------------------------------------------------
+
+class LiveStreamStartRequest(BaseModel):
+    triggering_command_id: Optional[uuid.UUID] = None
+
+class LiveStreamSessionResponse(BaseModel):
+    id: uuid.UUID
+    device_id: uuid.UUID
+    constable_id: uuid.UUID
+    room_name: str
+    status: LiveStreamStatus
+    started_by: LiveStreamStartedBy
+    triggering_command_id: Optional[uuid.UUID] = None
+    started_at: datetime
+    ended_at: Optional[datetime] = None
+    model_config = ConfigDict(from_attributes=True)
+
+class LiveStreamTokenResponse(BaseModel):
+    """Never includes the LiveKit API secret -- only a short-lived, single-purpose signed join token."""
+    session: LiveStreamSessionResponse
+    livekit_url: str
+    token: str
+    identity: str
+    can_publish: bool
