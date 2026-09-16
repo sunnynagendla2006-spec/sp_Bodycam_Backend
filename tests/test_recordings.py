@@ -585,3 +585,120 @@ def test_heartbeat_during_recording_does_not_clear_recording_status(full_client,
 
     device_resp = full_client.get(f"/devices/{device_id}", headers=headers)
     assert device_resp.json()["status"] == "recording"
+
+
+# ---------------------------------------------------------------------------
+# Chunk playback (/{recording_id}/chunks/{chunk_number}/stream) -- lets the
+# dashboard actually play back a recording instead of only listing chunk
+# metadata. Mirrors test_media_streaming.py's coverage of the analogous
+# evidence /stream endpoint (Range support, auth, audit).
+# ---------------------------------------------------------------------------
+def test_stream_chunk_success_via_bearer_header(full_client, make_constable, auth_header):
+    make_constable(phone="r000000038")
+    headers = auth_header("r000000038", "correct-horse-battery")
+    _register_device(full_client, headers, "phone-r038")
+    recording_id = _start_recording(full_client, headers, "phone-r038").json()["id"]
+    _upload_chunk(full_client, headers, recording_id, 1, content=MP4_BYTES)
+
+    resp = full_client.get(f"/recordings/{recording_id}/chunks/1/stream", headers=headers)
+    assert resp.status_code == 200
+    assert resp.content == MP4_BYTES
+    assert resp.headers["content-type"] == "video/mp4"
+    assert resp.headers["accept-ranges"] == "bytes"
+    assert resp.headers["content-length"] == str(len(MP4_BYTES))
+
+
+def test_stream_chunk_success_via_query_token(full_client, make_constable, auth_header):
+    """A <video> element can't set a custom Authorization header, so the
+    token must also work as a query parameter (see recordings.py's
+    _authenticate_stream_request)."""
+    make_constable(phone="r000000039")
+    headers = auth_header("r000000039", "correct-horse-battery")
+    token = headers["Authorization"].split(" ")[1]
+    _register_device(full_client, headers, "phone-r039")
+    recording_id = _start_recording(full_client, headers, "phone-r039").json()["id"]
+    _upload_chunk(full_client, headers, recording_id, 1, content=MP4_BYTES)
+
+    resp = full_client.get(f"/recordings/{recording_id}/chunks/1/stream?token={token}")
+    assert resp.status_code == 200
+    assert resp.content == MP4_BYTES
+
+
+def test_stream_chunk_range_request(full_client, make_constable, auth_header):
+    make_constable(phone="r000000040")
+    headers = auth_header("r000000040", "correct-horse-battery")
+    _register_device(full_client, headers, "phone-r040")
+    recording_id = _start_recording(full_client, headers, "phone-r040").json()["id"]
+    _upload_chunk(full_client, headers, recording_id, 1, content=MP4_BYTES)
+
+    resp = full_client.get(
+        f"/recordings/{recording_id}/chunks/1/stream",
+        headers={**headers, "Range": "bytes=0-9"},
+    )
+    assert resp.status_code == 206
+    assert resp.content == MP4_BYTES[0:10]
+    assert resp.headers["content-range"] == f"bytes 0-9/{len(MP4_BYTES)}"
+
+
+def test_stream_chunk_no_token_returns_401(full_client, make_constable, auth_header):
+    make_constable(phone="r000000041")
+    headers = auth_header("r000000041", "correct-horse-battery")
+    _register_device(full_client, headers, "phone-r041")
+    recording_id = _start_recording(full_client, headers, "phone-r041").json()["id"]
+    _upload_chunk(full_client, headers, recording_id, 1)
+
+    resp = full_client.get(f"/recordings/{recording_id}/chunks/1/stream")
+    assert resp.status_code == 401
+
+
+def test_stream_chunk_unauthorized_constable_gets_403(full_client, make_constable, auth_header):
+    make_constable(phone="r000000042a")
+    headers_a = auth_header("r000000042a", "correct-horse-battery")
+    _register_device(full_client, headers_a, "phone-r042")
+    recording_id = _start_recording(full_client, headers_a, "phone-r042").json()["id"]
+    _upload_chunk(full_client, headers_a, recording_id, 1)
+
+    make_constable(phone="r000000042b")
+    headers_b = auth_header("r000000042b", "correct-horse-battery")
+    resp = full_client.get(f"/recordings/{recording_id}/chunks/1/stream", headers=headers_b)
+    assert resp.status_code == 403
+
+
+def test_stream_chunk_admin_can_view_any_recording(full_client, make_user, make_constable, auth_header):
+    make_constable(phone="r000000043")
+    headers = auth_header("r000000043", "correct-horse-battery")
+    _register_device(full_client, headers, "phone-r043")
+    recording_id = _start_recording(full_client, headers, "phone-r043").json()["id"]
+    _upload_chunk(full_client, headers, recording_id, 1, content=MP4_BYTES)
+
+    make_user(phone="r000000043admin", password="pw", role=UserRole.admin)
+    admin_headers = auth_header("r000000043admin", "pw")
+    resp = full_client.get(f"/recordings/{recording_id}/chunks/1/stream", headers=admin_headers)
+    assert resp.status_code == 200
+    assert resp.content == MP4_BYTES
+
+
+def test_stream_nonexistent_chunk_returns_404(full_client, make_constable, auth_header):
+    make_constable(phone="r000000044")
+    headers = auth_header("r000000044", "correct-horse-battery")
+    _register_device(full_client, headers, "phone-r044")
+    recording_id = _start_recording(full_client, headers, "phone-r044").json()["id"]
+
+    resp = full_client.get(f"/recordings/{recording_id}/chunks/1/stream", headers=headers)
+    assert resp.status_code == 404
+
+
+def test_stream_chunk_creates_audit_entry(full_client, make_constable, auth_header, db_session):
+    make_constable(phone="r000000045")
+    headers = auth_header("r000000045", "correct-horse-battery")
+    _register_device(full_client, headers, "phone-r045")
+    recording_id = _start_recording(full_client, headers, "phone-r045").json()["id"]
+    _upload_chunk(full_client, headers, recording_id, 1)
+
+    full_client.get(f"/recordings/{recording_id}/chunks/1/stream", headers=headers)
+
+    logs = _get_logs(db_session, action="recording.chunk_streamed")
+    assert len(logs) == 1
+    details = json.loads(logs[0].details)
+    assert details["recording_id"] == recording_id
+    assert details["chunk_number"] == 1

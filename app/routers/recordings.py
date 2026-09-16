@@ -15,12 +15,16 @@ import hashlib
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile, File, status
+from fastapi import APIRouter, Depends, Form, Header, HTTPException, Query, UploadFile, File, status
+from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials
+from jose import JWTError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import database, models, schemas
-from ..auth.deps import get_current_user, require_role
+from ..auth.deps import bearer_scheme, get_current_user, require_role
+from ..auth.security import decode_access_token
 from ..services.audit import log_action
 from ..services import events
 from ..services import chunk_manifest as chunk_manifest_service
@@ -463,4 +467,128 @@ def get_recording_manifest(
         highest_chunk_number=summary.highest_received,
         missing_chunk_numbers=summary.missing_chunk_numbers,
         is_complete=(session.status == models.RecordingStatus.completed and summary.is_contiguous),
+    )
+
+
+def _authenticate_stream_request(
+    db: Session,
+    credentials: Optional[HTTPAuthorizationCredentials],
+    token_qs: Optional[str],
+) -> models.User:
+    """
+    A browser <video> element never sends a custom Authorization header on
+    its own GET/Range requests, so this endpoint must also accept the JWT
+    as a `?token=` query parameter -- mirrors websocket.py's
+    _authenticate_websocket exactly (same reason: WebSocket connections
+    from browser JS can't set custom headers either), rather than
+    reusing get_current_user's Bearer-only dependency, which cannot see a
+    query-string token. Prefers a real Authorization header when present
+    (e.g. non-browser callers, tests) and falls back to the query token.
+    """
+    raw_token = credentials.credentials if credentials and credentials.credentials else token_qs
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Not authenticated", headers={"WWW-Authenticate": "Bearer"})
+    try:
+        payload = decode_access_token(raw_token)
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Could not validate credentials", headers={"WWW-Authenticate": "Bearer"})
+    try:
+        user_id = uuid.UUID(payload.sub) if isinstance(payload.sub, str) else payload.sub
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=401, detail="Could not validate credentials", headers={"WWW-Authenticate": "Bearer"})
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user or user.status != models.UserStatus.active:
+        raise HTTPException(status_code=401, detail="Could not validate credentials", headers={"WWW-Authenticate": "Bearer"})
+    return user
+
+
+@router.get("/{recording_id}/chunks/{chunk_number}/stream")
+def stream_chunk(
+    recording_id: uuid.UUID,
+    chunk_number: int,
+    db: Session = Depends(database.get_db),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+    token: Optional[str] = Query(default=None),
+    range: Optional[str] = Header(default=None),
+):
+    """
+    Range-aware playback for a single stored chunk file, so RecordingDetails
+    can actually play back what was recorded instead of only listing chunk
+    metadata. Each chunk is an independent, fully valid segment file (real
+    device validation confirmed each one decodes correctly on its own via
+    ffprobe/VLC) -- this deliberately does NOT attempt to concatenate
+    chunks server-side into one continuous file (that would require an
+    ffmpeg-class remux step, a much larger and riskier addition); the
+    frontend instead plays chunks back-to-back in order.
+
+    Same authorization matrix as GET /{recording_id} and .../chunks (via
+    _authorize_recording_access) -- never the narrower _require_own_recording
+    used by the mutating endpoints, since viewing a recording someone else
+    made is exactly what admin/control_room/station need to be able to do.
+    Mirrors app/routers/media.py's stream_media Range handling exactly
+    (same 200-vs-206 behavior, same 416 contract) rather than reinventing
+    it, reusing the same storage backend VideoChunk already writes through.
+    """
+    current_user = _authenticate_stream_request(db, credentials, token)
+
+    session = db.query(models.RecordingSession).filter(models.RecordingSession.id == recording_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    if not _authorize_recording_access(db, session, current_user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to view this recording")
+
+    chunk = (
+        db.query(models.VideoChunk)
+        .filter(models.VideoChunk.recording_session_id == recording_id, models.VideoChunk.chunk_number == chunk_number)
+        .first()
+    )
+    if not chunk:
+        raise HTTPException(status_code=404, detail="Chunk not found")
+
+    storage = media_module._get_storage_backend()
+    if not storage.exists(chunk.storage_key):
+        raise HTTPException(status_code=404, detail="Chunk file not found")
+    size = storage.get_size(chunk.storage_key)
+    if size is None:
+        raise HTTPException(status_code=404, detail="Chunk file not found")
+
+    media_type = chunk.mime_type or "application/octet-stream"
+
+    def _audit(extra: dict):
+        log_action(
+            db,
+            user_id=current_user.id,
+            action="recording.chunk_streamed",
+            details={"recording_id": str(recording_id), "chunk_number": chunk_number, **extra},
+        )
+        db.commit()
+
+    if not range:
+        _audit({"access_method": "stream"})
+        headers = {
+            "Content-Length": str(size),
+            "Accept-Ranges": "bytes",
+        }
+        return StreamingResponse(
+            storage.read_range(chunk.storage_key, 0, size - 1),
+            media_type=media_type,
+            headers=headers,
+            status_code=200,
+        )
+
+    start, end, error = media_module._parse_range_header(range, size)
+    if error:
+        raise HTTPException(status_code=416, detail=error, headers={"Content-Range": f"bytes */{size}"})
+
+    _audit({"access_method": "stream", "range": f"{start}-{end}"})
+    headers = {
+        "Content-Range": f"bytes {start}-{end}/{size}",
+        "Content-Length": str(end - start + 1),
+        "Accept-Ranges": "bytes",
+    }
+    return StreamingResponse(
+        storage.read_range(chunk.storage_key, start, end),
+        media_type=media_type,
+        headers=headers,
+        status_code=206,
     )
