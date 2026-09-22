@@ -1,1 +1,1 @@
-{"chunk_size_mb": 10, "geofence_threshold_m": 25, "audio_alerts": false, "battery_warning_threshold": 20, "battery_critical_threshold": 10, "device_stale_seconds": 120, "device_offline_seconds": 600}
+{"chunk_size_mb": 10, "geofence_threshold_m": 25, "audio_alerts": false, "battery_warning_threshold": 20, "battery_critical_threshold": 10, "device_stale_seconds": 120, "device_offline_seconds": 600, "max_websocket_connections_per_room": 200}

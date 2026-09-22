@@ -393,6 +393,13 @@ class RecordingStartRequest(BaseModel):
     device_identifier: str = Field(..., min_length=1)
     trigger_type: RecordingTriggerType = RecordingTriggerType.manual
     incident_id: Optional[uuid.UUID] = None
+    # "front" | "back" -- validated in routers/recordings.py::start_recording
+    # (a plain Optional[str] here rather than a Literal so an unrecognized
+    # value is a clean, explicit 422 instead of a Pydantic-internal one).
+    # Defaults to "back" when omitted, matching the mobile app's own
+    # existing RecordingEngine default and every pre-existing caller that
+    # doesn't send this field at all.
+    camera_lens_direction: Optional[str] = None
 
 class RecordingSessionResponse(BaseModel):
     id: uuid.UUID
@@ -407,6 +414,13 @@ class RecordingSessionResponse(BaseModel):
     chunk_count: int = 0
     highest_chunk_number: Optional[int] = None
     missing_chunk_numbers: List[int] = []
+    # "not_ready" | "building" | "ready" | "failed" -- see
+    # recordings.py::_try_build_playable_recording. Never the storage_key
+    # itself (same "no raw paths" rule as everything else here) -- a
+    # client fetches the actual media via GET /recordings/{id}/play once
+    # this is "ready".
+    playable_status: str = "not_ready"
+    camera_lens_direction: str = "back"
     model_config = ConfigDict(from_attributes=True)
 
 class VideoChunkResponse(BaseModel):
@@ -421,6 +435,13 @@ class VideoChunkResponse(BaseModel):
     is_last_chunk: bool
     upload_status: str
     created_at: datetime
+    # Real GPS fix as of this segment, or null if genuinely unavailable at
+    # capture time -- see models.py::VideoChunk. Also burned directly into
+    # the chunk's video frames (routers/recordings.py::_burn_watermark_best_effort);
+    # exposed here too as queryable metadata, not a replacement for that.
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    recorded_at: Optional[datetime] = None
     model_config = ConfigDict(from_attributes=True)
 
 class RecordingManifestResponse(BaseModel):
@@ -497,6 +518,13 @@ class LiveStreamSessionResponse(BaseModel):
     triggering_command_id: Optional[uuid.UUID] = None
     started_at: datetime
     ended_at: Optional[datetime] = None
+    # Set only once LiveKit Egress's webhook confirms a real, completed
+    # recording exists for this session (see
+    # live_stream.py::_handle_egress_ended) -- null the entire time the
+    # session is live, and stays null forever if egress was never
+    # available/failed. When set, GET /recordings/{recording_session_id}
+    # and .../play work exactly like any other recording.
+    recording_session_id: Optional[uuid.UUID] = None
     model_config = ConfigDict(from_attributes=True)
 
 class LiveStreamTokenResponse(BaseModel):

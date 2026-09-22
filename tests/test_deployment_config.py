@@ -10,14 +10,21 @@ migration-behavior verification.
 """
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
+
+# Derived, not hardcoded, so this test suite runs on any host/OS -- this
+# file lives at <backend>/tests/test_deployment_config.py, so its
+# grandparent directory is <backend> (where .env.example and the app/
+# package actually live).
+BACKEND_DIR = Path(__file__).resolve().parent.parent
 
 
 def _run_python(code: str, env: dict) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-c", code],
-        cwd="/home/claude/project/backend",
+        cwd=str(BACKEND_DIR),
         env=env,
         capture_output=True,
         text=True,
@@ -102,7 +109,7 @@ def test_env_example_documents_every_variable_the_backend_actually_reads():
     """Prevents .env.example from silently drifting out of sync with the real source -- every os.getenv() call in app/ must have a corresponding line in .env.example."""
     import re
 
-    env_example_path = "/home/claude/project/backend/.env.example"
+    env_example_path = BACKEND_DIR / ".env.example"
     with open(env_example_path) as f:
         documented = set(re.findall(r"^([A-Z_][A-Z0-9_]*)=", f.read(), re.MULTILINE))
         documented |= set(re.findall(r"^# ([A-Z_][A-Z0-9_]*)=", open(env_example_path).read(), re.MULTILINE))
@@ -110,7 +117,7 @@ def test_env_example_documents_every_variable_the_backend_actually_reads():
     used_vars = set()
     import subprocess as sp
     result = sp.run(
-        ["grep", "-rhoE", r'os\.getenv\("[A-Z_][A-Z0-9_]*"', "/home/claude/project/backend/app"],
+        ["grep", "-rhoE", r'os\.getenv\("[A-Z_][A-Z0-9_]*"', str(BACKEND_DIR / "app")],
         capture_output=True, text=True,
     )
     for line in result.stdout.splitlines():

@@ -336,3 +336,51 @@ def test_failed_broadcast_does_not_break_business_operation(full_client, make_us
         resp = full_client.post(f"/incidents/{incident.id}/verify", headers=headers)
         assert resp.status_code == 200
         assert resp.json()["status"] == "verified"
+
+
+# ---------------------------------------------------------------------------
+# 38. per-room connection cap (connection-pool exhaustion protection)
+# ---------------------------------------------------------------------------
+def test_room_connection_cap_rejects_over_limit_without_affecting_other_rooms(
+    full_client, make_user, make_station, monkeypatch
+):
+    """
+    max_websocket_connections_per_room is read via the same load_settings()
+    pattern devices.py uses for device_stale_seconds (see
+    app/routers/settings.py). Connections at/under the cap for a room
+    succeed; the next one over the cap is rejected with the dedicated 4429
+    close code before ever being accepted -- and an unrelated room (a
+    different station here) is completely unaffected by a full room.
+    """
+    from app.routers import websocket as websocket_module
+
+    monkeypatch.setattr(
+        websocket_module, "load_settings", lambda: {"max_websocket_connections_per_room": 2}
+    )
+
+    make_user(phone="w000000018", password="pw", role=UserRole.control_room)
+    token = _token(full_client, "w000000018", "pw")
+
+    station = make_station()
+    make_user(phone="w000000018s", password="pw", role=UserRole.station, station_id=station.id)
+    station_token = _token(full_client, "w000000018s", "pw")
+
+    with full_client.websocket_connect(f"/ws/control_room?token={token}") as ws1:
+        with full_client.websocket_connect(f"/ws/control_room?token={token}") as ws2:
+            # Under the cap (2 of 2): both connections work normally.
+            ws1.send_text("ping")
+            assert ws1.receive_json()["event"] == "ack"
+            ws2.send_text("ping")
+            assert ws2.receive_json()["event"] == "ack"
+
+            # A third connection to the SAME (now-full) room is rejected.
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                with full_client.websocket_connect(f"/ws/control_room?token={token}"):
+                    pass
+            assert exc_info.value.code == 4429
+
+            # A DIFFERENT room (this station) is unaffected by the full
+            # control_room -- the cap is enforced per-room, not globally.
+            with full_client.websocket_connect(f"/ws/control_room?token={station_token}") as station_ws:
+                station_ws.send_text("ping")
+                assert station_ws.receive_json()["event"] == "ack"

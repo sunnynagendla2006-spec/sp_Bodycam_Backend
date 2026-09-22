@@ -24,6 +24,11 @@ class SystemSettings(BaseModel):
     battery_critical_threshold: int = 10
     device_stale_seconds: int = 120
     device_offline_seconds: int = 600
+    # Phase 8 (WebSocket hardening) addition: caps connections per room (see
+    # app/routers/websocket.py ConnectionManager) to protect against
+    # connection-pool exhaustion. Defaulted for the same reason as the
+    # fields above -- an existing settings.json still loads fine.
+    max_websocket_connections_per_room: int = 200
 
 def load_settings():
     if os.path.exists(SETTINGS_FILE):
@@ -37,6 +42,7 @@ def load_settings():
         "battery_critical_threshold": 10,
         "device_stale_seconds": 120,
         "device_offline_seconds": 600,
+        "max_websocket_connections_per_room": 200,
     }
 
 # These values (chunk size, geofence threshold, audio alert toggle) are

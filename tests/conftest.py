@@ -90,6 +90,7 @@ _ALL_TEST_TABLES = [
     models.RecordingSession.__table__,
     models.VideoChunk.__table__,
     models.RemoteCommand.__table__,
+    models.LiveStreamSession.__table__,
 ]
 
 
@@ -244,6 +245,7 @@ def full_client(db_session):
     from app.routers import commands as commands_router_module
     from app.routers import alerts as alerts_router_module
     from app.routers import websocket as websocket_router_module
+    from app.routers import live_stream as live_stream_router_module
 
     tmp_upload_dir = tempfile.mkdtemp(prefix="sp_test_uploads_")
     media_router_module.UPLOAD_DIR = tmp_upload_dir
@@ -261,6 +263,7 @@ def full_client(db_session):
     app.include_router(commands_router_module.router)
     app.include_router(alerts_router_module.router)
     app.include_router(websocket_router_module.router)
+    app.include_router(live_stream_router_module.router)
 
     def _override_get_db():
         try:

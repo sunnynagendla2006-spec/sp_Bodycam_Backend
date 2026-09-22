@@ -544,6 +544,19 @@ def list_constables(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to list constables")
 
     constables = query.all()
+    # Batch-fetched (not one query per constable) so the Live Map's roster
+    # call stays O(1) queries for station names regardless of roster size --
+    # station_id/station_name were previously missing from this response
+    # entirely, which is the one genuine gap the Live Map identity work
+    # needs filled (see routers/devices.py's DeviceResponse, which already
+    # has everything else: constable_id, latitude/longitude, status,
+    # location_updated_at).
+    station_ids = {c.station_id for c in constables if c.station_id}
+    stations_by_id = {}
+    if station_ids:
+        for s in db.query(models.PoliceStation).filter(models.PoliceStation.id.in_(station_ids)).all():
+            stations_by_id[s.id] = s.name
+
     results = []
     for c in constables:
         user = db.query(models.User).filter(models.User.id == c.user_id).first()
@@ -552,14 +565,16 @@ def list_constables(
             models.IncidentAssignment.status.in_(ACTIVE_ASSIGNMENT_STATUSES),
         ).first()
         results.append({
-            "id": str(c.id), 
-            "user_id": str(c.user_id), 
+            "id": str(c.id),
+            "user_id": str(c.user_id),
             "status": c.status.value,
             "badge_number": c.badge_number,
             "phone": user.phone if user else None,
             "last_login": c.last_login.isoformat() if c.last_login else None,
             "battery_level": c.battery_level,
-            "assigned_task": str(task.incident_id) if task else None
+            "assigned_task": str(task.incident_id) if task else None,
+            "station_id": str(c.station_id) if c.station_id else None,
+            "station_name": stations_by_id.get(c.station_id),
         })
     return results
 

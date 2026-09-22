@@ -396,6 +396,12 @@ class RecordingTriggerType(str, enum.Enum):
     emergency_button = "emergency_button"
     manual = "manual"
     remote = "remote"
+    # Server-side recording of a LiveStreamSession's room via LiveKit
+    # Egress -- see live_stream.py::_handle_egress_ended. Never created by
+    # a mobile chunk-upload flow (chunk_count stays 0 for these rows); it
+    # reuses this same table/playable_status pipeline purely so My
+    # Recordings and GET /recordings/{id}/play work for it unchanged.
+    live_stream = "live_stream"
 
 
 class RecordingStatus(str, enum.Enum):
@@ -419,6 +425,23 @@ class RecordingSession(Base):
     # evidentiary recording data.
     incident_id = Column(UUID(as_uuid=True), ForeignKey("incidents.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    # Server-side concatenated playable file, built best-effort from the
+    # individual chunks (still kept exactly as-is -- see
+    # recordings.py::_try_build_playable_recording) once a recording
+    # completes with no missing chunks. Plain string status rather than a
+    # new Postgres enum type: "not_ready" (default -- still recording, or
+    # completed with gaps that make concatenation impossible/skipped),
+    # "building", "ready", "failed" (ffmpeg itself failed -- chunks are
+    # still fully intact and individually downloadable regardless).
+    playable_status = Column(String, nullable=False, server_default="not_ready")
+    playable_storage_key = Column(String, nullable=True)
+    # "front" | "back" -- the lens actually used for this whole session
+    # (chosen once at /recordings/start, same as the mobile app's own
+    # RecordingEngine.start(lensDirection:), never changed mid-session).
+    # Plain string, same reasoning as playable_status above. Used by
+    # recordings.py::_burn_watermark_best_effort for the "CAMERA: FRONT/BACK"
+    # video overlay text.
+    camera_lens_direction = Column(String, nullable=False, server_default="back")
 
 
 class ChunkUploadStatus(str, enum.Enum):
@@ -439,6 +462,17 @@ class VideoChunk(Base):
     is_last_chunk = Column(Boolean, default=False, nullable=False)
     upload_status = Column(Enum(ChunkUploadStatus), default=ChunkUploadStatus.uploaded, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    # Real GPS fix + device-local capture time as of THIS segment, supplied
+    # by the mobile app from its existing LocationService cache (never
+    # polled per-chunk/per-frame -- see recording_service.dart). Null
+    # whenever GPS was genuinely unavailable at capture time -- never a
+    # fabricated coordinate. Kept here as queryable metadata in ADDITION to
+    # (not instead of) being burned into the video frames themselves by
+    # _burn_watermark_best_effort below -- the whole point of this feature
+    # is that the overlay must survive outside the app/API too.
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    recorded_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         # MANDATORY per the approved spec: a genuine DB-level constraint,
@@ -533,3 +567,15 @@ class LiveStreamSession(Base):
     triggering_command_id = Column(UUID(as_uuid=True), ForeignKey("remote_commands.id", ondelete="SET NULL"), nullable=True)
     started_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
     ended_at = Column(DateTime(timezone=True), nullable=True)
+
+    # LiveKit Egress recording of this session's room -- see
+    # live_stream.py's _start_egress_best_effort/_handle_egress_ended.
+    # egress_id is null whenever egress was never started (e.g. the egress
+    # infrastructure was unavailable at start time -- recording it is
+    # always best-effort and must never block/break live viewing itself).
+    # recording_session_id is only set once the egress webhook confirms a
+    # real completed recording exists (SET NULL so deleting the resulting
+    # RecordingSession -- e.g. future evidence-retention cleanup -- can
+    # never cascade into deleting this session's own history).
+    egress_id = Column(String, nullable=True)
+    recording_session_id = Column(UUID(as_uuid=True), ForeignKey("recording_sessions.id", ondelete="SET NULL"), nullable=True)

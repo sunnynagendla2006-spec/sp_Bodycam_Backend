@@ -3,11 +3,39 @@ Phase 2 (body-camera system) tests: RecordingSession + VideoChunk.
 """
 import io
 import json
+import subprocess
+import tempfile
+import os
+
+import pytest
 
 from app.models import UserRole, RecordingStatus, RecordingTriggerType
 
 JPEG_BYTES = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01" + (b"0123456789" * 10)
 MP4_BYTES = b"\x00\x00\x00\x18ftypmp42" + (b"0123456789" * 20)  # minimal valid "ftyp box" prefix recognized by _sniff_mime_type
+
+
+def _real_mp4_segment_bytes(index: int) -> bytes:
+    """
+    A real, ffmpeg-decodable MP4 (not just a fake ftyp-prefixed blob like
+    MP4_BYTES above) -- needed to test _try_build_playable_recording's
+    actual ffmpeg concat, which requires structurally valid MP4 input.
+    Generated fresh per call via ffmpeg's lavfi test source so these tests
+    don't depend on any checked-in binary fixture.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        out_path = os.path.join(tmp, f"seg{index}.mp4")
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=blue:s=32x32:d=1:r=2",
+                "-c:v", "mpeg4", "-pix_fmt", "yuv420p", out_path,
+            ],
+            capture_output=True,
+        )
+        if result.returncode != 0 or not os.path.exists(out_path):
+            pytest.skip(f"ffmpeg unavailable/failed in this test environment: {result.stderr.decode(errors='replace')[-500:]}")
+        with open(out_path, "rb") as f:
+            return f.read()
 
 
 def _get_logs(db_session, action=None):
@@ -206,6 +234,13 @@ def test_chunk_upload_rejected_when_recording_not_active(full_client, make_const
 
     resp = _upload_chunk(full_client, headers, recording_id, 1)
     assert resp.status_code == 409
+    # The mobile app's ChunkUploader must be able to tell this apart from a
+    # genuine "duplicate chunk, already accepted" 409 (see
+    # test_duplicate_chunk_number_rejected below) -- conflating the two was
+    # a real, physically-reproduced evidence-loss bug: a chunk rejected for
+    # THIS reason was never accepted server-side and its local copy must
+    # never be deleted, unlike a genuine duplicate.
+    assert resp.headers["x-conflict-reason"] == "recording_not_active"
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +258,10 @@ def test_duplicate_chunk_number_rejected(full_client, make_constable, auth_heade
     assert first.status_code == 200
     second = _upload_chunk(full_client, headers, recording_id, 1)
     assert second.status_code == 409
+    # Distinct from the "recording not active" 409 above -- see that test's
+    # comment. This one IS safe for the mobile client to treat as a
+    # confirmed-success idempotent retry.
+    assert second.headers["x-conflict-reason"] == "duplicate_chunk"
 
     chunks = db_session.query(models.VideoChunk).filter(models.VideoChunk.recording_session_id == uuid_module.UUID(recording_id)).all()
     assert len(chunks) == 1
@@ -702,3 +741,143 @@ def test_stream_chunk_creates_audit_entry(full_client, make_constable, auth_head
     details = json.loads(logs[0].details)
     assert details["recording_id"] == recording_id
     assert details["chunk_number"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Playable (server-side concatenated) recording -- /{id}/play.
+# See app/routers/recordings.py::_try_build_playable_recording. Uses real,
+# ffmpeg-decodable MP4 segments (not the fake MP4_BYTES blob used above,
+# which has no valid container structure past the ftyp box) since the
+# concat step genuinely shells out to ffmpeg.
+# ---------------------------------------------------------------------------
+def test_playable_recording_becomes_ready_on_contiguous_completion(full_client, make_constable, auth_header, db_session):
+    make_constable(phone="r000000046")
+    headers = auth_header("r000000046", "correct-horse-battery")
+    _register_device(full_client, headers, "phone-r046")
+    recording_id = _start_recording(full_client, headers, "phone-r046").json()["id"]
+
+    _upload_chunk(full_client, headers, recording_id, 1, content=_real_mp4_segment_bytes(1))
+    _upload_chunk(full_client, headers, recording_id, 2, content=_real_mp4_segment_bytes(2), is_last_chunk=True)
+
+    resp = full_client.post(f"/recordings/{recording_id}/complete", headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["playable_status"] == "ready"
+
+    from app import models
+    import uuid as uuid_module
+    session = db_session.query(models.RecordingSession).filter(models.RecordingSession.id == uuid_module.UUID(recording_id)).one()
+    assert session.playable_storage_key == f"recordings/{recording_id}/playable.mp4"
+
+
+def test_playable_recording_not_attempted_when_chunks_missing(full_client, make_constable, auth_header):
+    make_constable(phone="r000000047")
+    headers = auth_header("r000000047", "correct-horse-battery")
+    _register_device(full_client, headers, "phone-r047")
+    recording_id = _start_recording(full_client, headers, "phone-r047").json()["id"]
+
+    _upload_chunk(full_client, headers, recording_id, 1, content=_real_mp4_segment_bytes(1))
+    _upload_chunk(full_client, headers, recording_id, 3, content=_real_mp4_segment_bytes(3), is_last_chunk=True)  # chunk 2 missing
+
+    resp = full_client.post(f"/recordings/{recording_id}/complete", headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["missing_chunk_numbers"] == [2]
+    assert resp.json()["playable_status"] == "not_ready"  # concat skipped -- gap would corrupt/fail it
+
+
+def test_play_endpoint_returns_video_after_ready(full_client, make_constable, auth_header):
+    make_constable(phone="r000000048")
+    headers = auth_header("r000000048", "correct-horse-battery")
+    _register_device(full_client, headers, "phone-r048")
+    recording_id = _start_recording(full_client, headers, "phone-r048").json()["id"]
+    _upload_chunk(full_client, headers, recording_id, 1, content=_real_mp4_segment_bytes(1), is_last_chunk=True)
+    complete_resp = full_client.post(f"/recordings/{recording_id}/complete", headers=headers)
+    assert complete_resp.json()["playable_status"] == "ready"
+
+    resp = full_client.get(f"/recordings/{recording_id}/play", headers=headers)
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "video/mp4"
+    assert resp.headers["accept-ranges"] == "bytes"
+    assert len(resp.content) > 0
+
+
+def test_play_endpoint_supports_range_requests(full_client, make_constable, auth_header):
+    make_constable(phone="r000000049")
+    headers = auth_header("r000000049", "correct-horse-battery")
+    _register_device(full_client, headers, "phone-r049")
+    recording_id = _start_recording(full_client, headers, "phone-r049").json()["id"]
+    _upload_chunk(full_client, headers, recording_id, 1, content=_real_mp4_segment_bytes(1), is_last_chunk=True)
+    full_client.post(f"/recordings/{recording_id}/complete", headers=headers)
+
+    resp = full_client.get(f"/recordings/{recording_id}/play", headers={**headers, "Range": "bytes=0-9"})
+    assert resp.status_code == 206
+    assert len(resp.content) == 10
+    assert resp.headers["content-range"].startswith("bytes 0-9/")
+
+
+def test_play_endpoint_works_via_query_token(full_client, make_constable, auth_header):
+    make_constable(phone="r000000050")
+    headers = auth_header("r000000050", "correct-horse-battery")
+    token = headers["Authorization"].split(" ")[1]
+    _register_device(full_client, headers, "phone-r050")
+    recording_id = _start_recording(full_client, headers, "phone-r050").json()["id"]
+    _upload_chunk(full_client, headers, recording_id, 1, content=_real_mp4_segment_bytes(1), is_last_chunk=True)
+    full_client.post(f"/recordings/{recording_id}/complete", headers=headers)
+
+    resp = full_client.get(f"/recordings/{recording_id}/play?token={token}")
+    assert resp.status_code == 200
+    assert len(resp.content) > 0
+
+
+def test_play_endpoint_404_when_not_ready_yet(full_client, make_constable, auth_header):
+    make_constable(phone="r000000051")
+    headers = auth_header("r000000051", "correct-horse-battery")
+    _register_device(full_client, headers, "phone-r051")
+    recording_id = _start_recording(full_client, headers, "phone-r051").json()["id"]  # still recording, never completed
+
+    resp = full_client.get(f"/recordings/{recording_id}/play", headers=headers)
+    assert resp.status_code == 404
+
+
+def test_play_endpoint_unrelated_constable_gets_403(full_client, make_constable, auth_header):
+    """The core authorization requirement: a constable must never reach
+    another constable's playable recording by editing the ID -- same
+    _authorize_recording_access matrix as every other recording read."""
+    make_constable(phone="r000000052a")
+    make_constable(phone="r000000052b")
+    headers_a = auth_header("r000000052a", "correct-horse-battery")
+    headers_b = auth_header("r000000052b", "correct-horse-battery")
+    _register_device(full_client, headers_a, "phone-r052")
+    recording_id = _start_recording(full_client, headers_a, "phone-r052").json()["id"]
+    _upload_chunk(full_client, headers_a, recording_id, 1, content=_real_mp4_segment_bytes(1), is_last_chunk=True)
+    full_client.post(f"/recordings/{recording_id}/complete", headers=headers_a)
+
+    resp = full_client.get(f"/recordings/{recording_id}/play", headers=headers_b)
+    assert resp.status_code == 403
+
+
+def test_play_endpoint_no_token_returns_401(full_client, make_constable, auth_header):
+    make_constable(phone="r000000053")
+    headers = auth_header("r000000053", "correct-horse-battery")
+    _register_device(full_client, headers, "phone-r053")
+    recording_id = _start_recording(full_client, headers, "phone-r053").json()["id"]
+    _upload_chunk(full_client, headers, recording_id, 1, content=_real_mp4_segment_bytes(1), is_last_chunk=True)
+    full_client.post(f"/recordings/{recording_id}/complete", headers=headers)
+
+    resp = full_client.get(f"/recordings/{recording_id}/play")
+    assert resp.status_code == 401
+
+
+def test_play_endpoint_creates_audit_entry(full_client, make_constable, auth_header, db_session):
+    make_constable(phone="r000000054")
+    headers = auth_header("r000000054", "correct-horse-battery")
+    _register_device(full_client, headers, "phone-r054")
+    recording_id = _start_recording(full_client, headers, "phone-r054").json()["id"]
+    _upload_chunk(full_client, headers, recording_id, 1, content=_real_mp4_segment_bytes(1), is_last_chunk=True)
+    full_client.post(f"/recordings/{recording_id}/complete", headers=headers)
+
+    full_client.get(f"/recordings/{recording_id}/play", headers=headers)
+
+    logs = _get_logs(db_session, action="recording.played")
+    assert len(logs) == 1
+    details = json.loads(logs[0].details)
+    assert details["recording_id"] == recording_id

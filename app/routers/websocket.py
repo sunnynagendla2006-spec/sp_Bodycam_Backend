@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 
 from .. import database, models
 from ..auth.security import decode_access_token
+from .settings import load_settings
 
 router = APIRouter(prefix="/ws", tags=["WebSockets"])
 
@@ -48,6 +49,15 @@ class ConnectionManager:
 
     def add_constable(self, constable_id: uuid.UUID, ws: WebSocket):
         self.constable_connections.setdefault(constable_id, set()).add(ws)
+
+    def control_room_count(self) -> int:
+        return len(self.control_room_connections)
+
+    def station_count(self, station_id: uuid.UUID) -> int:
+        return len(self.station_connections.get(station_id, ()))
+
+    def constable_count(self, constable_id: uuid.UUID) -> int:
+        return len(self.constable_connections.get(constable_id, ()))
 
     def disconnect(self, ws: WebSocket, *, station_id: Optional[uuid.UUID] = None, constable_id: Optional[uuid.UUID] = None):
         """Remove a connection from wherever it was registered. Safe to call even if it was never added (e.g. auth failed before accept)."""
@@ -160,8 +170,16 @@ async def websocket_endpoint(
     role = user.role
     station_id: Optional[uuid.UUID] = None
     constable_id: Optional[uuid.UUID] = None
+    # 4429 (mirrors HTTP 429 Too Many Requests): the target room is already
+    # at max_websocket_connections_per_room -- a minimal cap against
+    # connection-pool exhaustion. Read the same way devices.py reads
+    # device_stale_seconds -- via load_settings(), not a hardcoded value.
+    max_per_room = load_settings().get("max_websocket_connections_per_room", 200)
 
     if role in (models.UserRole.admin, models.UserRole.control_room):
+        if manager.control_room_count() >= max_per_room:
+            await websocket.close(code=4429)
+            return
         await websocket.accept()
         manager.add_control_room(websocket)
     elif role == models.UserRole.station:
@@ -169,6 +187,9 @@ async def websocket_endpoint(
             await websocket.close(code=4403)
             return
         station_id = user.station_id
+        if manager.station_count(station_id) >= max_per_room:
+            await websocket.close(code=4429)
+            return
         await websocket.accept()
         manager.add_station(station_id, websocket)
     elif role == models.UserRole.constable:
@@ -177,6 +198,9 @@ async def websocket_endpoint(
             await websocket.close(code=4404)
             return
         constable_id = constable.id
+        if manager.constable_count(constable_id) >= max_per_room:
+            await websocket.close(code=4429)
+            return
         await websocket.accept()
         manager.add_constable(constable_id, websocket)
     else:
