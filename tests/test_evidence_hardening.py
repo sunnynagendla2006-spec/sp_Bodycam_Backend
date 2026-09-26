@@ -1,5 +1,5 @@
 """
-Phase-3 evidence/database hardening tests: MIME validation, size limits,
+Evidence/database hardening tests: MIME validation, size limits,
 path-traversal safety, SHA-256/file-size correctness, storage-key design,
 and response-shape checks (no internal path leakage).
 """
@@ -16,16 +16,21 @@ MP4_BYTES = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom" + b"\x00" * 64
 GARBAGE_BYTES = b"MZ\x90\x00\x03\x00\x00\x00" + b"\x00" * 64  # looks like a Windows PE header
 
 
+async def _get_evidence(evidence_id: str):
+    from app import models as app_models
+    return await app_models.Evidence.get(uuid_module.UUID(evidence_id))
+
+
 # ---------------------------------------------------------------------------
 # 1. Valid video upload
 # ---------------------------------------------------------------------------
-def test_valid_video_upload(full_client, make_constable, make_incident, make_assignment, auth_header):
-    _, constable = make_constable(phone="7000000001")
-    incident = make_incident()
-    make_assignment(constable_id=constable.id, incident_id=incident.id)
-    headers = auth_header("7000000001", "correct-horse-battery")
+async def test_valid_video_upload(full_client, make_constable, make_incident, make_assignment, auth_header):
+    _, constable = await make_constable(phone="7000000001")
+    incident = await make_incident()
+    await make_assignment(constable_id=constable.id, incident_id=incident.id)
+    headers = await auth_header("7000000001", "correct-horse-battery")
 
-    resp = full_client.post(
+    resp = await full_client.post(
         "/media/upload",
         data={"incident_id": str(incident.id), "type": "video"},
         files={"file": ("bodycam.mp4", MP4_BYTES, "video/mp4")},
@@ -40,13 +45,13 @@ def test_valid_video_upload(full_client, make_constable, make_incident, make_ass
 # ---------------------------------------------------------------------------
 # 2. Valid image upload
 # ---------------------------------------------------------------------------
-def test_valid_image_upload(full_client, make_constable, make_incident, make_assignment, auth_header):
-    _, constable = make_constable(phone="7000000002")
-    incident = make_incident()
-    make_assignment(constable_id=constable.id, incident_id=incident.id)
-    headers = auth_header("7000000002", "correct-horse-battery")
+async def test_valid_image_upload(full_client, make_constable, make_incident, make_assignment, auth_header):
+    _, constable = await make_constable(phone="7000000002")
+    incident = await make_incident()
+    await make_assignment(constable_id=constable.id, incident_id=incident.id)
+    headers = await auth_header("7000000002", "correct-horse-battery")
 
-    resp = full_client.post(
+    resp = await full_client.post(
         "/media/upload",
         data={"incident_id": str(incident.id), "type": "photo"},
         files={"file": ("scene.jpg", JPEG_BYTES, "image/jpeg")},
@@ -58,13 +63,13 @@ def test_valid_image_upload(full_client, make_constable, make_incident, make_ass
 # ---------------------------------------------------------------------------
 # 3. Invalid MIME type
 # ---------------------------------------------------------------------------
-def test_invalid_mime_type_rejected(full_client, make_constable, make_incident, make_assignment, auth_header):
-    _, constable = make_constable(phone="7000000003")
-    incident = make_incident()
-    make_assignment(constable_id=constable.id, incident_id=incident.id)
-    headers = auth_header("7000000003", "correct-horse-battery")
+async def test_invalid_mime_type_rejected(full_client, make_constable, make_incident, make_assignment, auth_header):
+    _, constable = await make_constable(phone="7000000003")
+    incident = await make_incident()
+    await make_assignment(constable_id=constable.id, incident_id=incident.id)
+    headers = await auth_header("7000000003", "correct-horse-battery")
 
-    resp = full_client.post(
+    resp = await full_client.post(
         "/media/upload",
         data={"incident_id": str(incident.id), "type": "video"},
         files={"file": ("evidence.mp4", GARBAGE_BYTES, "application/octet-stream")},
@@ -76,18 +81,18 @@ def test_invalid_mime_type_rejected(full_client, make_constable, make_incident, 
 # ---------------------------------------------------------------------------
 # 4. Oversized upload -> 413
 # ---------------------------------------------------------------------------
-def test_oversized_upload_rejected(full_client, make_constable, make_incident, make_assignment, auth_header, monkeypatch):
-    _, constable = make_constable(phone="7000000004")
-    incident = make_incident()
-    make_assignment(constable_id=constable.id, incident_id=incident.id)
-    headers = auth_header("7000000004", "correct-horse-battery")
+async def test_oversized_upload_rejected(full_client, make_constable, make_incident, make_assignment, auth_header, monkeypatch):
+    _, constable = await make_constable(phone="7000000004")
+    incident = await make_incident()
+    await make_assignment(constable_id=constable.id, incident_id=incident.id)
+    headers = await auth_header("7000000004", "correct-horse-battery")
 
     # Shrink the limit for this test only, rather than actually sending
     # hundreds of MB.
     monkeypatch.setattr(media_router_module, "MAX_EVIDENCE_SIZE_BYTES", 50)
 
     oversized_content = JPEG_BYTES + (b"\x00" * 1000)  # well over 50 bytes
-    resp = full_client.post(
+    resp = await full_client.post(
         "/media/upload",
         data={"incident_id": str(incident.id), "type": "photo"},
         files={"file": ("big.jpg", oversized_content, "image/jpeg")},
@@ -99,15 +104,15 @@ def test_oversized_upload_rejected(full_client, make_constable, make_incident, m
 # ---------------------------------------------------------------------------
 # 5. Path traversal filename
 # ---------------------------------------------------------------------------
-def test_path_traversal_filename_is_neutralized(
-    full_client, make_constable, make_incident, make_assignment, auth_header, db_session
+async def test_path_traversal_filename_is_neutralized(
+    full_client, make_constable, make_incident, make_assignment, auth_header
 ):
-    _, constable = make_constable(phone="7000000005")
-    incident = make_incident()
-    make_assignment(constable_id=constable.id, incident_id=incident.id)
-    headers = auth_header("7000000005", "correct-horse-battery")
+    _, constable = await make_constable(phone="7000000005")
+    incident = await make_incident()
+    await make_assignment(constable_id=constable.id, incident_id=incident.id)
+    headers = await auth_header("7000000005", "correct-horse-battery")
 
-    resp = full_client.post(
+    resp = await full_client.post(
         "/media/upload",
         data={"incident_id": str(incident.id), "type": "photo"},
         files={"file": ("../../../etc/passwd.jpg", JPEG_BYTES, "image/jpeg")},
@@ -115,11 +120,7 @@ def test_path_traversal_filename_is_neutralized(
     )
     assert resp.status_code == 200, resp.text
     evidence_id = resp.json()["evidence_id"]
-
-    from app import models as app_models
-    stored = db_session.query(app_models.Evidence).filter(
-        app_models.Evidence.id == uuid_module.UUID(evidence_id)
-    ).first()
+    stored = await _get_evidence(evidence_id)
 
     # The sanitized display filename must not contain any path separators
     # or ".." traversal sequences.
@@ -145,13 +146,13 @@ def test_path_traversal_filename_is_neutralized(
 # ---------------------------------------------------------------------------
 # 6. SHA-256 hash correctness
 # ---------------------------------------------------------------------------
-def test_sha256_hash_is_correct(full_client, make_constable, make_incident, make_assignment, auth_header):
-    _, constable = make_constable(phone="7000000006")
-    incident = make_incident()
-    make_assignment(constable_id=constable.id, incident_id=incident.id)
-    headers = auth_header("7000000006", "correct-horse-battery")
+async def test_sha256_hash_is_correct(full_client, make_constable, make_incident, make_assignment, auth_header):
+    _, constable = await make_constable(phone="7000000006")
+    incident = await make_incident()
+    await make_assignment(constable_id=constable.id, incident_id=incident.id)
+    headers = await auth_header("7000000006", "correct-horse-battery")
 
-    resp = full_client.post(
+    resp = await full_client.post(
         "/media/upload",
         data={"incident_id": str(incident.id), "type": "photo"},
         files={"file": ("scene.jpg", JPEG_BYTES, "image/jpeg")},
@@ -165,41 +166,37 @@ def test_sha256_hash_is_correct(full_client, make_constable, make_incident, make
 # ---------------------------------------------------------------------------
 # 7. File size correctness
 # ---------------------------------------------------------------------------
-def test_file_size_recorded_correctly(
-    full_client, make_constable, make_incident, make_assignment, auth_header, db_session
+async def test_file_size_recorded_correctly(
+    full_client, make_constable, make_incident, make_assignment, auth_header
 ):
-    _, constable = make_constable(phone="7000000007")
-    incident = make_incident()
-    make_assignment(constable_id=constable.id, incident_id=incident.id)
-    headers = auth_header("7000000007", "correct-horse-battery")
+    _, constable = await make_constable(phone="7000000007")
+    incident = await make_incident()
+    await make_assignment(constable_id=constable.id, incident_id=incident.id)
+    headers = await auth_header("7000000007", "correct-horse-battery")
 
-    resp = full_client.post(
+    resp = await full_client.post(
         "/media/upload",
         data={"incident_id": str(incident.id), "type": "photo"},
         files={"file": ("scene.jpg", JPEG_BYTES, "image/jpeg")},
         headers=headers,
     )
     evidence_id = resp.json()["evidence_id"]
-
-    from app import models as app_models
-    stored = db_session.query(app_models.Evidence).filter(
-        app_models.Evidence.id == uuid_module.UUID(evidence_id)
-    ).first()
+    stored = await _get_evidence(evidence_id)
     assert stored.file_size == len(JPEG_BYTES)
 
 
 # ---------------------------------------------------------------------------
 # 8 & 17. Original filename preserved only as metadata; no absolute path leaked
 # ---------------------------------------------------------------------------
-def test_response_never_exposes_filesystem_path(
+async def test_response_never_exposes_filesystem_path(
     full_client, make_constable, make_incident, make_assignment, auth_header
 ):
-    _, constable = make_constable(phone="7000000008")
-    incident = make_incident()
-    make_assignment(constable_id=constable.id, incident_id=incident.id)
-    headers = auth_header("7000000008", "correct-horse-battery")
+    _, constable = await make_constable(phone="7000000008")
+    incident = await make_incident()
+    await make_assignment(constable_id=constable.id, incident_id=incident.id)
+    headers = await auth_header("7000000008", "correct-horse-battery")
 
-    resp = full_client.post(
+    resp = await full_client.post(
         "/media/upload",
         data={"incident_id": str(incident.id), "type": "photo"},
         files={"file": ("scene.jpg", JPEG_BYTES, "image/jpeg")},
@@ -209,7 +206,7 @@ def test_response_never_exposes_filesystem_path(
     assert "file_path" not in body
     assert "storage_key" not in body
 
-    list_resp = full_client.get("/media/", headers=headers)
+    list_resp = await full_client.get("/media/", headers=headers)
     assert list_resp.status_code == 200
     for item in list_resp.json():
         assert "file_path" not in item
@@ -223,59 +220,53 @@ def test_response_never_exposes_filesystem_path(
 #    test_path_traversal_filename_is_neutralized; this adds a plain-filename
 #    sanity check for the common case)
 # ---------------------------------------------------------------------------
-def test_storage_key_shape(full_client, make_constable, make_incident, make_assignment, auth_header, db_session):
-    _, constable = make_constable(phone="7000000009")
-    incident = make_incident()
-    make_assignment(constable_id=constable.id, incident_id=incident.id)
-    headers = auth_header("7000000009", "correct-horse-battery")
+async def test_storage_key_shape(full_client, make_constable, make_incident, make_assignment, auth_header):
+    _, constable = await make_constable(phone="7000000009")
+    incident = await make_incident()
+    await make_assignment(constable_id=constable.id, incident_id=incident.id)
+    headers = await auth_header("7000000009", "correct-horse-battery")
 
-    resp = full_client.post(
+    resp = await full_client.post(
         "/media/upload",
         data={"incident_id": str(incident.id), "type": "photo"},
         files={"file": ("scene.jpg", JPEG_BYTES, "image/jpeg")},
         headers=headers,
     )
     evidence_id = resp.json()["evidence_id"]
-    from app import models as app_models
-    stored = db_session.query(app_models.Evidence).filter(
-        app_models.Evidence.id == uuid_module.UUID(evidence_id)
-    ).first()
+    stored = await _get_evidence(evidence_id)
     assert stored.storage_key == f"evidence/{incident.id}/{stored.id}.jpg"
 
 
 # ---------------------------------------------------------------------------
 # 10. Evidence references existing incident
 # ---------------------------------------------------------------------------
-def test_evidence_references_existing_incident(
-    full_client, make_constable, make_incident, make_assignment, auth_header, db_session
+async def test_evidence_references_existing_incident(
+    full_client, make_constable, make_incident, make_assignment, auth_header
 ):
-    _, constable = make_constable(phone="7000000010")
-    incident = make_incident()
-    make_assignment(constable_id=constable.id, incident_id=incident.id)
-    headers = auth_header("7000000010", "correct-horse-battery")
+    _, constable = await make_constable(phone="7000000010")
+    incident = await make_incident()
+    await make_assignment(constable_id=constable.id, incident_id=incident.id)
+    headers = await auth_header("7000000010", "correct-horse-battery")
 
-    resp = full_client.post(
+    resp = await full_client.post(
         "/media/upload",
         data={"incident_id": str(incident.id), "type": "photo"},
         files={"file": ("scene.jpg", JPEG_BYTES, "image/jpeg")},
         headers=headers,
     )
     evidence_id = resp.json()["evidence_id"]
-    from app import models as app_models
-    stored = db_session.query(app_models.Evidence).filter(
-        app_models.Evidence.id == uuid_module.UUID(evidence_id)
-    ).first()
+    stored = await _get_evidence(evidence_id)
     assert stored.incident_id == incident.id
 
 
 # ---------------------------------------------------------------------------
 # 11. Nonexistent incident rejected
 # ---------------------------------------------------------------------------
-def test_upload_to_nonexistent_incident_returns_404(full_client, make_constable, auth_header):
-    _, constable = make_constable(phone="7000000011")
-    headers = auth_header("7000000011", "correct-horse-battery")
+async def test_upload_to_nonexistent_incident_returns_404(full_client, make_constable, auth_header):
+    _, constable = await make_constable(phone="7000000011")
+    headers = await auth_header("7000000011", "correct-horse-battery")
 
-    resp = full_client.post(
+    resp = await full_client.post(
         "/media/upload",
         data={"incident_id": str(uuid_module.uuid4()), "type": "photo"},
         files={"file": ("scene.jpg", JPEG_BYTES, "image/jpeg")},
@@ -287,25 +278,22 @@ def test_upload_to_nonexistent_incident_returns_404(full_client, make_constable,
 # ---------------------------------------------------------------------------
 # 13. Constable uploader identity comes from JWT
 # ---------------------------------------------------------------------------
-def test_uploader_identity_derived_from_jwt(
-    full_client, make_constable, make_incident, make_assignment, auth_header, db_session
+async def test_uploader_identity_derived_from_jwt(
+    full_client, make_constable, make_incident, make_assignment, auth_header
 ):
-    user, constable = make_constable(phone="7000000013")
-    incident = make_incident()
-    make_assignment(constable_id=constable.id, incident_id=incident.id)
-    headers = auth_header("7000000013", "correct-horse-battery")
+    user, constable = await make_constable(phone="7000000013")
+    incident = await make_incident()
+    await make_assignment(constable_id=constable.id, incident_id=incident.id)
+    headers = await auth_header("7000000013", "correct-horse-battery")
 
-    resp = full_client.post(
+    resp = await full_client.post(
         "/media/upload",
         data={"incident_id": str(incident.id), "type": "photo"},
         files={"file": ("scene.jpg", JPEG_BYTES, "image/jpeg")},
         headers=headers,
     )
     evidence_id = resp.json()["evidence_id"]
-    from app import models as app_models
-    stored = db_session.query(app_models.Evidence).filter(
-        app_models.Evidence.id == uuid_module.UUID(evidence_id)
-    ).first()
+    stored = await _get_evidence(evidence_id)
     assert str(stored.uploader_id) == str(user.id)
     assert stored.uploader_role == UserRole.constable
 
@@ -313,18 +301,18 @@ def test_uploader_identity_derived_from_jwt(
 # ---------------------------------------------------------------------------
 # 14. Spoofed uploader/constable ID ignored (extra unrecognized form fields
 #     have no effect; the only accepted spoof vector, constable_id, is
-#     covered by the existing Phase-2 test and still passes -- see below)
+#     covered by the existing authorization test and still passes)
 # ---------------------------------------------------------------------------
-def test_unrecognized_uploader_id_form_field_has_no_effect(
-    full_client, make_constable, make_incident, make_assignment, auth_header, db_session
+async def test_unrecognized_uploader_id_form_field_has_no_effect(
+    full_client, make_constable, make_incident, make_assignment, auth_header
 ):
-    user, constable = make_constable(phone="7000000014")
+    user, constable = await make_constable(phone="7000000014")
     other_user_id = uuid_module.uuid4()
-    incident = make_incident()
-    make_assignment(constable_id=constable.id, incident_id=incident.id)
-    headers = auth_header("7000000014", "correct-horse-battery")
+    incident = await make_incident()
+    await make_assignment(constable_id=constable.id, incident_id=incident.id)
+    headers = await auth_header("7000000014", "correct-horse-battery")
 
-    resp = full_client.post(
+    resp = await full_client.post(
         "/media/upload",
         # uploader_id is not a real accepted field at all -- FastAPI simply
         # ignores form fields that aren't declared parameters. Confirms
@@ -335,10 +323,7 @@ def test_unrecognized_uploader_id_form_field_has_no_effect(
     )
     assert resp.status_code == 200
     evidence_id = resp.json()["evidence_id"]
-    from app import models as app_models
-    stored = db_session.query(app_models.Evidence).filter(
-        app_models.Evidence.id == uuid_module.UUID(evidence_id)
-    ).first()
+    stored = await _get_evidence(evidence_id)
     assert str(stored.uploader_id) == str(user.id)
     assert str(stored.uploader_id) != str(other_user_id)
 
@@ -346,13 +331,13 @@ def test_unrecognized_uploader_id_form_field_has_no_effect(
 # ---------------------------------------------------------------------------
 # 16. Uploaded evidence starts with status "uploaded"
 # ---------------------------------------------------------------------------
-def test_new_evidence_starts_uploaded(full_client, make_constable, make_incident, make_assignment, auth_header):
-    _, constable = make_constable(phone="7000000016")
-    incident = make_incident()
-    make_assignment(constable_id=constable.id, incident_id=incident.id)
-    headers = auth_header("7000000016", "correct-horse-battery")
+async def test_new_evidence_starts_uploaded(full_client, make_constable, make_incident, make_assignment, auth_header):
+    _, constable = await make_constable(phone="7000000016")
+    incident = await make_incident()
+    await make_assignment(constable_id=constable.id, incident_id=incident.id)
+    headers = await auth_header("7000000016", "correct-horse-battery")
 
-    resp = full_client.post(
+    resp = await full_client.post(
         "/media/upload",
         data={"incident_id": str(incident.id), "type": "photo"},
         files={"file": ("scene.jpg", JPEG_BYTES, "image/jpeg")},
@@ -363,28 +348,28 @@ def test_new_evidence_starts_uploaded(full_client, make_constable, make_incident
 
 # ---------------------------------------------------------------------------
 # 18. Evidence download still requires authorization (unauthenticated case;
-#     ownership-denial cases are already covered by the Phase-2 tests and
-#     continue to pass unmodified -- see test_authorization.py)
+#     ownership-denial cases are already covered elsewhere -- see
+#     test_authorization.py)
 # ---------------------------------------------------------------------------
-def test_download_still_requires_authentication(full_client, make_incident, make_evidence):
-    incident = make_incident()
-    evidence = make_evidence(incident_id=incident.id)
-    resp = full_client.get(f"/media/{evidence.id}/download")
+async def test_download_still_requires_authentication(full_client, make_incident, make_evidence):
+    incident = await make_incident()
+    evidence = await make_evidence(incident_id=incident.id)
+    resp = await full_client.get(f"/media/{evidence.id}/download")
     assert resp.status_code == 401
 
 
 # ---------------------------------------------------------------------------
 # GPS metadata: stored, but distinguished from server timestamp
 # ---------------------------------------------------------------------------
-def test_client_gps_metadata_is_stored_but_not_authoritative(
-    full_client, make_constable, make_incident, make_assignment, auth_header, db_session
+async def test_client_gps_metadata_is_stored_but_not_authoritative(
+    full_client, make_constable, make_incident, make_assignment, auth_header
 ):
-    _, constable = make_constable(phone="7000000020")
-    incident = make_incident()
-    make_assignment(constable_id=constable.id, incident_id=incident.id)
-    headers = auth_header("7000000020", "correct-horse-battery")
+    _, constable = await make_constable(phone="7000000020")
+    incident = await make_incident()
+    await make_assignment(constable_id=constable.id, incident_id=incident.id)
+    headers = await auth_header("7000000020", "correct-horse-battery")
 
-    resp = full_client.post(
+    resp = await full_client.post(
         "/media/upload",
         data={
             "incident_id": str(incident.id),
@@ -399,10 +384,7 @@ def test_client_gps_metadata_is_stored_but_not_authoritative(
     )
     assert resp.status_code == 200
     evidence_id = resp.json()["evidence_id"]
-    from app import models as app_models
-    stored = db_session.query(app_models.Evidence).filter(
-        app_models.Evidence.id == uuid_module.UUID(evidence_id)
-    ).first()
+    stored = await _get_evidence(evidence_id)
     assert stored.evidence_metadata["latitude"] == 16.5062
     assert stored.evidence_metadata["device_timestamp"] == "2026-08-21T10:00:00Z"
     # Server timestamp is a distinct, separately-generated column.

@@ -1,6 +1,17 @@
 -r requirements.txt
 pytest==8.2.0
+pytest-asyncio==0.23.6
 # NOTE: httpx>=0.28 removed the TestClient(app=...) shortcut that
-# starlette==0.36 (pinned via fastapi==0.110.0) relies on. Keep httpx pinned
-# below 0.28 until fastapi/starlette are upgraded together.
+# starlette==0.36 (pinned via fastapi==0.110.0) relies on. The test suite
+# now uses httpx.AsyncClient(transport=ASGIWebSocketTransport(...)) instead
+# (needed to share one asyncio event loop with the Motor/Beanie calls in
+# fixtures and route handlers -- Starlette's TestClient spins up its own
+# separate thread/loop per request, which breaks Motor), which doesn't
+# depend on that shortcut -- but keep httpx pinned below 0.28 anyway until
+# fastapi/starlette are upgraded together, since other parts of the stack
+# still assume starlette==0.36.
 httpx==0.27.0
+# ASGIWebSocketTransport extends httpx.ASGITransport with WebSocket-upgrade
+# support (plain ASGITransport is HTTP-only) -- used for the websocket
+# tests via httpx_ws.aconnect_ws(), on the same event loop as everything else.
+httpx-ws==0.9.0

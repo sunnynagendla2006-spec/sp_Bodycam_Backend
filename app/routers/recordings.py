@@ -1,10 +1,10 @@
 """
-Phase 2 (body-camera system): RecordingSession + VideoChunk.
+RecordingSession + embedded VideoChunk (see models.Chunk's docstring for
+why chunks are embedded rather than a separate collection).
 
 Reuses the existing evidence storage/validation pipeline from
 app/routers/media.py (ALLOWED_MIME_TO_EXT, MIME sniffing, storage backend
-abstraction) rather than duplicating it -- a second, unsafe storage
-implementation is exactly what the approved spec forbids.
+abstraction) rather than duplicating it.
 
 RecordingSession deliberately never requires an Incident (incident_id is
 optional) -- a constable must be able to start an emergency recording
@@ -22,10 +22,11 @@ from fastapi import APIRouter, Depends, Form, Header, HTTPException, Query, Uplo
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from jose import JWTError
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from pymongo import ReturnDocument
 
-from .. import database, models, schemas
+from beanie.operators import In
+
+from .. import models, schemas
 from ..auth.deps import bearer_scheme, get_current_user, require_role
 from ..auth.security import decode_access_token
 from ..services.audit import log_action
@@ -46,14 +47,6 @@ def _utcnow():
 
 
 def _build_chunk_storage_key(recording_session_id: uuid.UUID, chunk_number: int, mime_type: str) -> str:
-    """
-    Both path components are server-controlled: recording_session_id is a
-    UUID (never client-suppliable as a path -- it's the resource being
-    addressed, validated by FastAPI's uuid.UUID path-param typing before
-    this ever runs), and chunk_number is formatted as a zero-padded
-    integer, never inserted as a raw string. No client-supplied filename
-    is ever used to build a path (mirrors media.py::_build_storage_key).
-    """
     ext = media_module.ALLOWED_MIME_TO_EXT.get(mime_type, "")
     return f"recordings/{recording_session_id}/chunk_{chunk_number:06d}{ext}"
 
@@ -77,9 +70,6 @@ def _format_watermark_text(
 
 
 def _escape_drawtext(text: str) -> str:
-    """Escapes characters ffmpeg's drawtext `text=` filter parameter treats
-    specially. Only ever applied to server-generated strings (status labels)
-    -- never raw client input reaches a filtergraph string anywhere here."""
     return text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
 
@@ -94,22 +84,10 @@ async def _burn_watermark_best_effort(
 ) -> Optional[tuple[int, str]]:
     """
     Re-encodes the chunk at storage_key IN PLACE, burning a status/GPS/
-    timestamp/camera overlay directly into the video frames. This is a
-    genuine pixel-level change -- never a Flutter UI overlay (which would
-    only exist on-screen, not in the encoded file) and never a raw byte
-    edit (drawtext/drawbox require an actual decode+re-encode of the video
-    stream, via ffmpeg, the same tool/pattern _try_build_playable_recording
-    already uses for the separate concat step below). The audio stream is
-    stream-copied (-c:a copy) since drawtext never touches audio.
-
-    Never raises and never corrupts/loses the chunk: on ANY failure (ffmpeg
-    missing, decode error, an S3-backed deployment, etc.) the ORIGINAL file
-    at storage_key is left completely untouched -- still fully valid,
-    individually playable evidence, just without the burned overlay this
-    one time. Returns (new_size, new_sha256_hex) on success so the caller
-    can update the VideoChunk row to describe the bytes actually now on
-    disk; returns None on skip/failure, meaning the caller's original
-    file_size/file_hash (from the as-uploaded bytes) remain correct as-is.
+    timestamp/camera overlay directly into the video frames. Never raises
+    and never corrupts/loses the chunk: on ANY failure the ORIGINAL file at
+    storage_key is left completely untouched. Returns (new_size,
+    new_sha256_hex) on success, None on skip/failure.
     """
     if not isinstance(storage, storage_service.LocalFilesystemStorage):
         logger.warning(f"chunk {storage_key}: watermark burn skipped -- not on LocalFilesystemStorage")
@@ -127,11 +105,6 @@ async def _burn_watermark_best_effort(
         with open(info_text_path, "w") as f:
             f.write(info_text)
 
-        # Small red square + status label top-left; semi-transparent info
-        # block bottom-left (GPS/time/camera) -- positioned so neither
-        # covers the center of the frame, per the design brief. h-th-14
-        # positions the (possibly multi-line) info block a fixed 14px above
-        # the bottom edge regardless of how tall the rendered text block is.
         vf = (
             "drawbox=x=10:y=10:w=22:h=22:color=red@0.9:t=fill,"
             f"drawtext=text='{_escape_drawtext(status_text)}':fontfile={_WATERMARK_FONT_PATH}:"
@@ -184,13 +157,8 @@ async def _burn_watermark_best_effort(
     return new_size, new_hash
 
 
-def _chunk_numbers_for(db: Session, recording_session_id: uuid.UUID) -> list[int]:
-    rows = db.query(models.VideoChunk.chunk_number).filter(models.VideoChunk.recording_session_id == recording_session_id).all()
-    return [r[0] for r in rows]
-
-
-def _to_recording_response(db: Session, session: models.RecordingSession) -> schemas.RecordingSessionResponse:
-    summary = chunk_manifest_service.summarize_chunks(_chunk_numbers_for(db, session.id))
+def _to_recording_response(session: models.RecordingSession) -> schemas.RecordingSessionResponse:
+    summary = chunk_manifest_service.summarize_chunks([c.chunk_number for c in session.chunks])
     return schemas.RecordingSessionResponse(
         id=session.id,
         constable_id=session.constable_id,
@@ -209,7 +177,7 @@ def _to_recording_response(db: Session, session: models.RecordingSession) -> sch
     )
 
 
-def _authorize_recording_access(db: Session, session: models.RecordingSession, current_user: models.User) -> bool:
+async def _authorize_recording_access(session: models.RecordingSession, current_user: models.User) -> bool:
     """
     admin/control_room: any recording.
     station: only recordings belonging to constables assigned to that station.
@@ -222,23 +190,23 @@ def _authorize_recording_access(db: Session, session: models.RecordingSession, c
     if role == models.UserRole.station:
         if not current_user.station_id:
             return False
-        constable = db.query(models.Constable).filter(models.Constable.id == session.constable_id).first()
+        constable = await models.Constable.get(session.constable_id)
         return constable is not None and constable.station_id == current_user.station_id
     if role == models.UserRole.constable:
-        own_constable = get_own_constable(db, current_user)
+        own_constable = await get_own_constable(current_user)
         return own_constable is not None and session.constable_id == own_constable.id
     return False
 
 
-def _require_own_recording(db: Session, current_user: models.User, recording_id: uuid.UUID):
-    """Used by the mutating endpoints (chunks/complete/cancel) -- ownership only, not the broader read-authorization matrix above (a station/control_room user may VIEW a recording but must never be able to mutate a constable's own in-progress recording)."""
+async def _require_own_recording(current_user: models.User, recording_id: uuid.UUID):
+    """Used by the mutating endpoints (chunks/complete/cancel) -- ownership only."""
     if current_user.role != models.UserRole.constable:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the recording constable may perform this action")
-    own_constable = get_own_constable(db, current_user)
+    own_constable = await get_own_constable(current_user)
     if not own_constable:
         raise HTTPException(status_code=404, detail="Constable profile not found")
 
-    session = db.query(models.RecordingSession).filter(models.RecordingSession.id == recording_id).first()
+    session = await models.RecordingSession.get(recording_id)
     if not session:
         raise HTTPException(status_code=404, detail="Recording not found")
     if session.constable_id != own_constable.id:
@@ -250,14 +218,13 @@ def _require_own_recording(db: Session, current_user: models.User, recording_id:
 @router.post("/start", response_model=schemas.RecordingSessionResponse)
 async def start_recording(
     payload: schemas.RecordingStartRequest,
-    db: Session = Depends(database.get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    """Constable-only, for their own already-registered device (reuses the exact ownership check from Phase 1's heartbeat/battery endpoints)."""
-    own_constable, device = _require_own_device_for_constable(db, current_user, payload.device_identifier)
+    """Constable-only, for their own already-registered device (reuses the exact ownership check from devices.py's heartbeat/battery endpoints)."""
+    own_constable, device = await _require_own_device_for_constable(current_user, payload.device_identifier)
 
     if payload.incident_id is not None:
-        incident = db.query(models.Incident).filter(models.Incident.id == payload.incident_id).first()
+        incident = await models.Incident.get(payload.incident_id)
         if not incident:
             raise HTTPException(status_code=404, detail="Referenced incident not found")
 
@@ -273,24 +240,20 @@ async def start_recording(
         incident_id=payload.incident_id,
         camera_lens_direction=camera_lens_direction,
     )
-    db.add(session)
+    await session.insert()
     device.status = models.DeviceStatus.recording  # see devices.py::compute_effective_status for how this is surfaced
+    await device.save()
 
-    db.flush()
-    log_action(
-        db,
+    await log_action(
         user_id=current_user.id,
         action="recording.started",
         incident_id=payload.incident_id,
         details={"recording_session_id": str(session.id), "trigger_type": payload.trigger_type.value, "device_id": str(device.id)},
     )
 
-    db.commit()
-    db.refresh(session)
-
     await events.publish_recording_started(session, own_constable.station_id)
 
-    return _to_recording_response(db, session)
+    return _to_recording_response(session)
 
 
 @router.post("/{recording_id}/chunks", response_model=schemas.VideoChunkResponse)
@@ -299,36 +262,26 @@ async def upload_chunk(
     chunk_number: int = Form(...),
     duration_seconds: Optional[float] = Form(None),
     is_last_chunk: bool = Form(False),
-    # Real GPS fix (from the mobile app's existing cached LocationService --
-    # see recording_service.dart) and device-local capture time as of THIS
-    # segment. All optional: an older client, or a device with no GPS fix
-    # yet, simply omits them -- the watermark burn below then shows "GPS:
-    # SIGNAL UNAVAILABLE" rather than treating it as an error.
     latitude: Optional[float] = Form(None),
     longitude: Optional[float] = Form(None),
     recorded_at: Optional[str] = Form(None),
     file: UploadFile = File(...),
-    db: Session = Depends(database.get_db),
     current_user: models.User = Depends(get_current_user),
 ):
     """
     Out-of-order arrival is fully supported -- chunk_number is preserved
     exactly as supplied, never physically reordered or renamed on disk.
     Duplicate chunk_number is rejected with 409, protected by BOTH an
-    application-level fast-path check AND the genuine
-    uq_chunk_number_per_recording database constraint (see Task 5) --
-    the fast-path check alone cannot close a race between two concurrent
-    uploads of the same chunk_number.
+    application-level fast-path check AND an atomic `find_one_and_update`
+    array-push (the direct Mongo equivalent of the old
+    uq_chunk_number_per_recording database constraint) -- the fast-path
+    check alone cannot close a race between two concurrent uploads of the
+    same chunk_number, but the atomic push (which only matches when no
+    existing array element already has this chunk_number) can.
     """
-    own_constable, session = _require_own_recording(db, current_user, recording_id)
+    own_constable, session = await _require_own_recording(current_user, recording_id)
 
     if session.status != models.RecordingStatus.recording:
-        # Distinct from the "duplicate chunk" 409 below via the
-        # X-Conflict-Reason header -- see chunk_uploader.dart's matching
-        # handling for why these two, despite sharing an HTTP status code,
-        # must never be treated the same by the client: this one means the
-        # chunk was NEVER accepted and its local copy must be preserved,
-        # not deleted.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Cannot upload chunks to a recording in status {session.status.value}",
@@ -338,12 +291,7 @@ async def upload_chunk(
         raise HTTPException(status_code=422, detail="chunk_number must be >= 1")
 
     # Fast-path duplicate check (not the genuine safety net -- see below).
-    existing = (
-        db.query(models.VideoChunk)
-        .filter(models.VideoChunk.recording_session_id == recording_id, models.VideoChunk.chunk_number == chunk_number)
-        .first()
-    )
-    if existing:
+    if any(c.chunk_number == chunk_number for c in session.chunks):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Chunk {chunk_number} was already uploaded for this recording",
@@ -403,12 +351,6 @@ async def upload_chunk(
         except ValueError:
             parsed_recorded_at = None  # malformed value from an old/buggy client -- never fatal, just omitted
 
-    # Best-effort: burns STATUS/GPS/TIME/CAMERA into this chunk's actual
-    # video frames, re-encoding the file in place at storage_key. Never
-    # raises -- on any failure the original, un-watermarked-but-perfectly-
-    # valid chunk is left exactly as uploaded (see the function's own
-    # docstring). Only on success are file_hash/bytes_written updated below
-    # to reflect the real, now-watermarked bytes actually stored.
     burn_result = await _burn_watermark_best_effort(
         storage=storage,
         storage_key=storage_key,
@@ -420,8 +362,7 @@ async def upload_chunk(
     if burn_result is not None:
         bytes_written, file_hash = burn_result
 
-    chunk = models.VideoChunk(
-        recording_session_id=recording_id,
+    chunk = models.Chunk(
         chunk_number=chunk_number,
         storage_key=storage_key,
         file_size=bytes_written,
@@ -435,80 +376,70 @@ async def upload_chunk(
         recorded_at=parsed_recorded_at,
     )
 
-    try:
-        with db.begin_nested():
-            db.add(chunk)
-            db.flush()
-    except IntegrityError:
-        # Lost the race against uq_chunk_number_per_recording -- a
-        # concurrent request already committed this exact chunk_number.
-        # The SAVEPOINT rollback (handled automatically by the `with`
-        # block above on exception) leaves the outer session/transaction
-        # perfectly usable -- nothing here poisons it.
+    updated = await models.RecordingSession.get_motor_collection().find_one_and_update(
+        {"_id": recording_id, "chunks.chunk_number": {"$ne": chunk_number}},
+        {"$push": {"chunks": chunk.model_dump()}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        # Lost the race -- a concurrent request already pushed this exact
+        # chunk_number in between our fast-path check and this atomic push.
         storage.delete(storage_key)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Chunk {chunk_number} was already uploaded for this recording",
             headers={"X-Conflict-Reason": "duplicate_chunk"},
         )
+    session.chunks.append(chunk)
 
-    log_action(
-        db,
+    await log_action(
         user_id=current_user.id,
         action="recording.chunk_uploaded",
         incident_id=session.incident_id,
         details={"recording_session_id": str(recording_id), "chunk_number": chunk_number, "file_hash": file_hash, "file_size": bytes_written},
     )
 
-    try:
-        db.commit()
-    except Exception:
-        db.rollback()
-        storage.delete(storage_key)
-        raise
-    db.refresh(chunk)
-
     await events.publish_recording_chunk_uploaded(session, own_constable.station_id, chunk_number, is_last_chunk)
 
-    return chunk
+    return schemas.VideoChunkResponse(
+        id=chunk.id,
+        recording_session_id=recording_id,
+        chunk_number=chunk.chunk_number,
+        file_size=chunk.file_size,
+        duration_seconds=chunk.duration_seconds,
+        file_hash=chunk.file_hash,
+        mime_type=chunk.mime_type,
+        is_last_chunk=chunk.is_last_chunk,
+        upload_status=chunk.upload_status.value,
+        created_at=chunk.created_at,
+        latitude=chunk.latitude,
+        longitude=chunk.longitude,
+        recorded_at=chunk.recorded_at,
+    )
 
 
-async def _try_build_playable_recording(db: Session, session: models.RecordingSession) -> None:
+async def _try_build_playable_recording(session: models.RecordingSession) -> None:
     """
     Best-effort: concatenates this recording's chunks (in chunk_number
     order) into one playable file via ffmpeg's concat demuxer with stream
-    copy (`-c copy` -- no re-encoding, so this is a real remux, never a
-    raw byte-slice/concatenation of MP4 files, which would corrupt the
-    container). Never raises: any failure here must never fail the
-    /complete request itself, and never touches the individual chunk
-    files/rows, which remain the authoritative evidence either way.
-
-    Only runs against the LocalFilesystemStorage backend (the one actually
-    deployed here -- see storage.py's get_storage_backend default). Against
-    an S3-backed deployment this cleanly records "failed" with a clear
-    reason rather than downloading every chunk into this process first,
-    which would be a much larger, separate piece of work.
+    copy. Never raises. Only runs against the LocalFilesystemStorage
+    backend.
     """
     storage = media_module._get_storage_backend()
     if not isinstance(storage, storage_service.LocalFilesystemStorage):
         session.playable_status = "failed"
-        db.commit()
+        await session.save()
         logger.warning(f"recording {session.id}: playable build skipped -- not on LocalFilesystemStorage")
         return
 
-    chunks = (
-        db.query(models.VideoChunk)
-        .filter(models.VideoChunk.recording_session_id == session.id)
-        .order_by(models.VideoChunk.chunk_number.asc())
-        .all()
-    )
+    chunks = sorted(session.chunks, key=lambda c: c.chunk_number)
     if not chunks:
         session.playable_status = "failed"
-        db.commit()
+        await session.save()
         return
 
     session.playable_status = "building"
-    db.commit()
+    await session.save()
 
     playable_key = f"recordings/{session.id}/playable.mp4"
     playable_abs_path = storage._abs_path(playable_key)
@@ -548,206 +479,179 @@ async def _try_build_playable_recording(db: Session, session: models.RecordingSe
                 os.remove(playable_abs_path)
         except OSError:
             pass
-    db.commit()
+    await session.save()
 
 
 @router.post("/{recording_id}/complete", response_model=schemas.RecordingSessionResponse)
 async def complete_recording(
     recording_id: uuid.UUID,
-    db: Session = Depends(database.get_db),
     current_user: models.User = Depends(get_current_user),
 ):
     """
     RECORDING -> COMPLETED only; any other current status is a 409.
-
-    Completion is ALLOWED even with missing chunks (network conditions can
-    legitimately and permanently prevent a chunk from ever arriving --
-    blocking completion forever would trap the recording in limbo). The
-    gap is never hidden: missing_chunk_numbers is included in the
-    response, the audit record, and the recording.completed WebSocket
-    event.
+    Completion is ALLOWED even with missing chunks.
     """
-    own_constable, session = _require_own_recording(db, current_user, recording_id)
+    own_constable, session = await _require_own_recording(current_user, recording_id)
     if session.status != models.RecordingStatus.recording:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Cannot complete a recording in status {session.status.value}")
 
-    summary = chunk_manifest_service.summarize_chunks(_chunk_numbers_for(db, recording_id))
+    summary = chunk_manifest_service.summarize_chunks([c.chunk_number for c in session.chunks])
 
     session.status = models.RecordingStatus.completed
     session.ended_at = _utcnow()
+    await session.save()
 
-    device = db.query(models.Device).filter(models.Device.id == session.device_id).first()
+    device = await models.Device.get(session.device_id)
     if device and device.status == models.DeviceStatus.recording:
         device.status = models.DeviceStatus.online
+        await device.save()
 
-    log_action(
-        db,
+    await log_action(
         user_id=current_user.id,
         action="recording.completed",
         incident_id=session.incident_id,
         details={"recording_session_id": str(recording_id), "missing_chunk_numbers": summary.missing_chunk_numbers, "chunk_count": len(summary.received_chunk_numbers)},
     )
 
-    db.commit()
-    db.refresh(session)
-
     await events.publish_recording_completed(session, own_constable.station_id, summary.missing_chunk_numbers)
 
-    # Best-effort, additive only -- see _try_build_playable_recording's
-    # docstring. Only attempted when every chunk actually arrived; a gap
-    # means ffmpeg concat would either fail outright or silently produce a
-    # playable file with a real missing segment, neither of which is
-    # acceptable for evidence. The chunks/manifest remain the authoritative
-    # record regardless of whether this succeeds.
     if summary.is_contiguous:
-        await _try_build_playable_recording(db, session)
+        await _try_build_playable_recording(session)
 
-    return _to_recording_response(db, session)
+    return _to_recording_response(session)
 
 
 @router.post("/{recording_id}/cancel", response_model=schemas.RecordingSessionResponse)
 async def cancel_recording(
     recording_id: uuid.UUID,
-    db: Session = Depends(database.get_db),
     current_user: models.User = Depends(get_current_user),
 ):
     """RECORDING -> CANCELLED only; any other current status is a 409."""
-    own_constable, session = _require_own_recording(db, current_user, recording_id)
+    own_constable, session = await _require_own_recording(current_user, recording_id)
     if session.status != models.RecordingStatus.recording:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Cannot cancel a recording in status {session.status.value}")
 
     session.status = models.RecordingStatus.cancelled
     session.ended_at = _utcnow()
+    await session.save()
 
-    device = db.query(models.Device).filter(models.Device.id == session.device_id).first()
+    device = await models.Device.get(session.device_id)
     if device and device.status == models.DeviceStatus.recording:
         device.status = models.DeviceStatus.online
+        await device.save()
 
-    log_action(
-        db,
+    await log_action(
         user_id=current_user.id,
         action="recording.cancelled",
         incident_id=session.incident_id,
         details={"recording_session_id": str(recording_id)},
     )
 
-    db.commit()
-    db.refresh(session)
-
     await events.publish_recording_cancelled(session, own_constable.station_id)
 
-    return _to_recording_response(db, session)
+    return _to_recording_response(session)
 
 
 @router.get("/", response_model=list[schemas.RecordingSessionResponse])
-def list_recordings(
+async def list_recordings(
     device_id: Optional[uuid.UUID] = None,
     status: Optional[models.RecordingStatus] = None,
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
-    db: Session = Depends(database.get_db),
     current_user: models.User = Depends(require_role("admin", "control_room", "station", "constable")),
 ):
     """
-    Phase 4A: read-only listing so Control Room can discover recordings
-    without already knowing a recording_id (previously the ONLY way to
-    reach a recording was already having its ID, e.g. from a live
-    `recording.started` WebSocket event). Never starts/stops/mutates a
-    recording -- purely a query over existing RecordingSession rows.
-
-    Same authorization matrix as GET /recordings/{id} (see
-    _authorize_recording_access): admin/control_room see everything;
-    station sees only recordings whose constable belongs to their
-    station; constable sees only their own; citizen is denied entirely
-    (matching every other device/recording endpoint in this project).
-
-    Reuses _to_recording_response for each row so the computed fields
-    (chunk_count, highest_chunk_number, missing_chunk_numbers) are
-    identical to what GET /recordings/{id} already returns -- no
-    duplicated/divergent logic.
+    Read-only listing so Control Room can discover recordings without
+    already knowing a recording_id. Same authorization matrix as GET
+    /recordings/{id} (see _authorize_recording_access).
     """
     role = current_user.role
-    query = db.query(models.RecordingSession)
+    query = models.RecordingSession.find()
 
     if role in (models.UserRole.admin, models.UserRole.control_room):
         pass
     elif role == models.UserRole.station:
         if not current_user.station_id:
             return []
-        station_constable_ids = db.query(models.Constable.id).filter(models.Constable.station_id == current_user.station_id)
-        query = query.filter(models.RecordingSession.constable_id.in_(station_constable_ids))
+        station_constable_ids = [
+            c.id for c in await models.Constable.find(models.Constable.station_id == current_user.station_id).to_list()
+        ]
+        query = query.find(In(models.RecordingSession.constable_id, station_constable_ids))
     elif role == models.UserRole.constable:
-        own_constable = get_own_constable(db, current_user)
+        own_constable = await get_own_constable(current_user)
         if not own_constable:
             return []
-        query = query.filter(models.RecordingSession.constable_id == own_constable.id)
+        query = query.find(models.RecordingSession.constable_id == own_constable.id)
 
     if device_id is not None:
-        query = query.filter(models.RecordingSession.device_id == device_id)
+        query = query.find(models.RecordingSession.device_id == device_id)
     if status is not None:
-        query = query.filter(models.RecordingSession.status == status)
+        query = query.find(models.RecordingSession.status == status)
 
-    sessions = (
-        query.order_by(models.RecordingSession.created_at.desc())
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
-    return [_to_recording_response(db, s) for s in sessions]
+    sessions = await query.sort(-models.RecordingSession.created_at).skip(offset).limit(limit).to_list()
+    return [_to_recording_response(s) for s in sessions]
 
 
 @router.get("/{recording_id}", response_model=schemas.RecordingSessionResponse)
-def get_recording(
+async def get_recording(
     recording_id: uuid.UUID,
-    db: Session = Depends(database.get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    session = db.query(models.RecordingSession).filter(models.RecordingSession.id == recording_id).first()
+    session = await models.RecordingSession.get(recording_id)
     if not session:
         raise HTTPException(status_code=404, detail="Recording not found")
-    if not _authorize_recording_access(db, session, current_user):
+    if not await _authorize_recording_access(session, current_user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to view this recording")
 
-    return _to_recording_response(db, session)
+    return _to_recording_response(session)
 
 
 @router.get("/{recording_id}/chunks", response_model=schemas.RecordingManifestResponse)
-def get_recording_manifest(
+async def get_recording_manifest(
     recording_id: uuid.UUID,
-    db: Session = Depends(database.get_db),
     current_user: models.User = Depends(get_current_user),
 ):
     """
-    Ordered chunk manifest -- NOT a live stream. Chunks are always
-    returned ordered by chunk_number regardless of upload arrival order.
-    Never exposes storage_key/filesystem paths (see schemas.VideoChunkResponse).
+    Ordered chunk manifest -- NOT a live stream. Never exposes
+    storage_key/filesystem paths (see schemas.VideoChunkResponse).
     """
-    session = db.query(models.RecordingSession).filter(models.RecordingSession.id == recording_id).first()
+    session = await models.RecordingSession.get(recording_id)
     if not session:
         raise HTTPException(status_code=404, detail="Recording not found")
-    if not _authorize_recording_access(db, session, current_user):
+    if not await _authorize_recording_access(session, current_user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to view this recording")
 
-    chunks = (
-        db.query(models.VideoChunk)
-        .filter(models.VideoChunk.recording_session_id == recording_id)
-        .order_by(models.VideoChunk.chunk_number.asc())
-        .all()
-    )
+    chunks = sorted(session.chunks, key=lambda c: c.chunk_number)
     summary = chunk_manifest_service.summarize_chunks([c.chunk_number for c in chunks])
 
     return schemas.RecordingManifestResponse(
         recording_session_id=recording_id,
         status=session.status,
-        chunks=chunks,
+        chunks=[
+            schemas.VideoChunkResponse(
+                id=c.id,
+                recording_session_id=recording_id,
+                chunk_number=c.chunk_number,
+                file_size=c.file_size,
+                duration_seconds=c.duration_seconds,
+                file_hash=c.file_hash,
+                mime_type=c.mime_type,
+                is_last_chunk=c.is_last_chunk,
+                upload_status=c.upload_status.value,
+                created_at=c.created_at,
+                latitude=c.latitude,
+                longitude=c.longitude,
+                recorded_at=c.recorded_at,
+            )
+            for c in chunks
+        ],
         highest_chunk_number=summary.highest_received,
         missing_chunk_numbers=summary.missing_chunk_numbers,
         is_complete=(session.status == models.RecordingStatus.completed and summary.is_contiguous),
     )
 
 
-def _authenticate_stream_request(
-    db: Session,
+async def _authenticate_stream_request(
     credentials: Optional[HTTPAuthorizationCredentials],
     token_qs: Optional[str],
 ) -> models.User:
@@ -755,11 +659,7 @@ def _authenticate_stream_request(
     A browser <video> element never sends a custom Authorization header on
     its own GET/Range requests, so this endpoint must also accept the JWT
     as a `?token=` query parameter -- mirrors websocket.py's
-    _authenticate_websocket exactly (same reason: WebSocket connections
-    from browser JS can't set custom headers either), rather than
-    reusing get_current_user's Bearer-only dependency, which cannot see a
-    query-string token. Prefers a real Authorization header when present
-    (e.g. non-browser callers, tests) and falls back to the query token.
+    _authenticate_websocket.
     """
     raw_token = credentials.credentials if credentials and credentials.credentials else token_qs
     if not raw_token:
@@ -772,52 +672,35 @@ def _authenticate_stream_request(
         user_id = uuid.UUID(payload.sub) if isinstance(payload.sub, str) else payload.sub
     except (ValueError, AttributeError, TypeError):
         raise HTTPException(status_code=401, detail="Could not validate credentials", headers={"WWW-Authenticate": "Bearer"})
-    user = db.query(models.User).filter(models.User.id == user_id).first()
+    user = await models.User.get(user_id)
     if not user or user.status != models.UserStatus.active:
         raise HTTPException(status_code=401, detail="Could not validate credentials", headers={"WWW-Authenticate": "Bearer"})
     return user
 
 
 @router.get("/{recording_id}/chunks/{chunk_number}/stream")
-def stream_chunk(
+async def stream_chunk(
     recording_id: uuid.UUID,
     chunk_number: int,
-    db: Session = Depends(database.get_db),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
     token: Optional[str] = Query(default=None),
     range: Optional[str] = Header(default=None),
 ):
     """
-    Range-aware playback for a single stored chunk file, so RecordingDetails
-    can actually play back what was recorded instead of only listing chunk
-    metadata. Each chunk is an independent, fully valid segment file (real
-    device validation confirmed each one decodes correctly on its own via
-    ffprobe/VLC). Kept as its own endpoint even now that a concatenated
-    file also exists (see /play below) -- it needs no playable_status
-    check and works even when concatenation failed/hasn't run, and the web
-    dashboard's chunk-by-chunk player still uses it unchanged.
-
-    Same authorization matrix as GET /{recording_id} and .../chunks (via
+    Range-aware playback for a single stored chunk file. Same authorization
+    matrix as GET /{recording_id} and .../chunks (via
     _authorize_recording_access) -- never the narrower _require_own_recording
-    used by the mutating endpoints, since viewing a recording someone else
-    made is exactly what admin/control_room/station need to be able to do.
-    Mirrors app/routers/media.py's stream_media Range handling exactly
-    (same 200-vs-206 behavior, same 416 contract) rather than reinventing
-    it, reusing the same storage backend VideoChunk already writes through.
+    used by the mutating endpoints.
     """
-    current_user = _authenticate_stream_request(db, credentials, token)
+    current_user = await _authenticate_stream_request(credentials, token)
 
-    session = db.query(models.RecordingSession).filter(models.RecordingSession.id == recording_id).first()
+    session = await models.RecordingSession.get(recording_id)
     if not session:
         raise HTTPException(status_code=404, detail="Recording not found")
-    if not _authorize_recording_access(db, session, current_user):
+    if not await _authorize_recording_access(session, current_user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to view this recording")
 
-    chunk = (
-        db.query(models.VideoChunk)
-        .filter(models.VideoChunk.recording_session_id == recording_id, models.VideoChunk.chunk_number == chunk_number)
-        .first()
-    )
+    chunk = next((c for c in session.chunks if c.chunk_number == chunk_number), None)
     if not chunk:
         raise HTTPException(status_code=404, detail="Chunk not found")
 
@@ -830,17 +713,15 @@ def stream_chunk(
 
     media_type = chunk.mime_type or "application/octet-stream"
 
-    def _audit(extra: dict):
-        log_action(
-            db,
+    async def _audit(extra: dict):
+        await log_action(
             user_id=current_user.id,
             action="recording.chunk_streamed",
             details={"recording_id": str(recording_id), "chunk_number": chunk_number, **extra},
         )
-        db.commit()
 
     if not range:
-        _audit({"access_method": "stream"})
+        await _audit({"access_method": "stream"})
         headers = {
             "Content-Length": str(size),
             "Accept-Ranges": "bytes",
@@ -856,7 +737,7 @@ def stream_chunk(
     if error:
         raise HTTPException(status_code=416, detail=error, headers={"Content-Range": f"bytes */{size}"})
 
-    _audit({"access_method": "stream", "range": f"{start}-{end}"})
+    await _audit({"access_method": "stream", "range": f"{start}-{end}"})
     headers = {
         "Content-Range": f"bytes {start}-{end}/{size}",
         "Content-Length": str(end - start + 1),
@@ -871,37 +752,22 @@ def stream_chunk(
 
 
 @router.get("/{recording_id}/play")
-def play_recording(
+async def play_recording(
     recording_id: uuid.UUID,
-    db: Session = Depends(database.get_db),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
     token: Optional[str] = Query(default=None),
     range: Optional[str] = Header(default=None),
 ):
     """
     Range-aware playback of the single concatenated recording (see
-    _try_build_playable_recording) -- what the mobile video player and any
-    future single-file web player actually load, as opposed to
-    .../chunks/{n}/stream's per-chunk playback. Same
-    _authenticate_stream_request (header or query token -- a mobile
-    video_player/exoplayer sends a real Authorization header; a browser
-    <video> element cannot) and the same _authorize_recording_access
-    matrix as every other read on this recording -- a constable can never
-    reach another constable's recording here by editing the ID in the
-    request, same as .../chunks/{n}/stream and GET /{recording_id} already
-    guarantee (see test_unrelated_constable_cannot_view_another_constables_recording).
-
-    404 when no playable file exists yet -- distinguished in `detail`
-    between "still building/never attempted" and "failed" so the client
-    can decide whether to retry later or fall back to per-chunk playback,
-    without guessing from a bare 404.
+    _try_build_playable_recording).
     """
-    current_user = _authenticate_stream_request(db, credentials, token)
+    current_user = await _authenticate_stream_request(credentials, token)
 
-    session = db.query(models.RecordingSession).filter(models.RecordingSession.id == recording_id).first()
+    session = await models.RecordingSession.get(recording_id)
     if not session:
         raise HTTPException(status_code=404, detail="Recording not found")
-    if not _authorize_recording_access(db, session, current_user):
+    if not await _authorize_recording_access(session, current_user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to view this recording")
 
     if session.playable_status != "ready" or not session.playable_storage_key:
@@ -917,17 +783,15 @@ def play_recording(
 
     media_type = "video/mp4"
 
-    def _audit(extra: dict):
-        log_action(
-            db,
+    async def _audit(extra: dict):
+        await log_action(
             user_id=current_user.id,
             action="recording.played",
             details={"recording_id": str(recording_id), **extra},
         )
-        db.commit()
 
     if not range:
-        _audit({"access_method": "play"})
+        await _audit({"access_method": "play"})
         headers = {"Content-Length": str(size), "Accept-Ranges": "bytes"}
         return StreamingResponse(
             storage.read_range(session.playable_storage_key, 0, size - 1),
@@ -940,7 +804,7 @@ def play_recording(
     if error:
         raise HTTPException(status_code=416, detail=error, headers={"Content-Range": f"bytes */{size}"})
 
-    _audit({"access_method": "play", "range": f"{start}-{end}"})
+    await _audit({"access_method": "play", "range": f"{start}-{end}"})
     headers = {
         "Content-Range": f"bytes {start}-{end}/{size}",
         "Content-Length": str(end - start + 1),

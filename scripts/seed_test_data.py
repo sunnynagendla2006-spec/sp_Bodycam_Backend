@@ -27,12 +27,14 @@ Usage:
     python scripts/seed_test_data.py --reset     # remove ONLY this test data
 """
 import argparse
+import asyncio
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.database import SessionLocal
+from app.database import init_db
+from app.geo import point
 from app.models import User, UserRole, UserStatus, Constable, ConstableStatus, PoliceStation, Device, DeviceStatus
 from app.auth.security import hash_password
 
@@ -59,104 +61,97 @@ TEST_DEVICE_PREFIX = "TEST-BODYCAM-"
 TEST_STATION_NAMES = [s["name"] for s in STATIONS]
 
 
-def seed():
-    db = SessionLocal()
-    try:
-        stations_by_name = {}
-        for s in STATIONS:
-            existing = db.query(PoliceStation).filter(PoliceStation.name == s["name"]).first()
-            if existing:
-                stations_by_name[s["name"]] = existing
-                continue
-            station = PoliceStation(
-                name=s["name"],
-                location=f"POINT({s['longitude']} {s['latitude']})",
-                contact="000-0000",
+async def seed():
+    await init_db()
+
+    stations_by_name = {}
+    for s in STATIONS:
+        existing = await PoliceStation.find_one(PoliceStation.name == s["name"])
+        if existing:
+            stations_by_name[s["name"]] = existing
+            continue
+        station = PoliceStation(
+            name=s["name"],
+            location=point(s["longitude"], s["latitude"]),
+            contact="000-0000",
+        )
+        await station.insert()
+        stations_by_name[s["name"]] = station
+        print(f"created station: {s['name']} (SYNTHETIC TEST LOCATION {s['latitude']}, {s['longitude']})")
+
+    hashed_pwd = hash_password(TEST_PASSWORD)
+    for c in CONSTABLES:
+        badge = f"Constable Test {c['n']:02d}"
+        device_identifier = f"{TEST_DEVICE_PREFIX}{c['n']:03d}"
+        station = stations_by_name[c["station"]]
+
+        user = await User.find_one(User.phone == c["phone"])
+        if not user:
+            user = User(phone=c["phone"], role=UserRole.constable, status=UserStatus.active, hashed_password=hashed_pwd)
+            await user.insert()
+            print(f"created user: {c['phone']} (role=constable)")
+
+        constable = await Constable.find_one(Constable.user_id == user.id)
+        if not constable:
+            constable = Constable(
+                user_id=user.id,
+                badge_number=badge,
+                station_id=station.id,
+                status=ConstableStatus.offline,
             )
-            db.add(station)
-            db.flush()
-            stations_by_name[s["name"]] = station
-            print(f"created station: {s['name']} (SYNTHETIC TEST LOCATION {s['latitude']}, {s['longitude']})")
+            await constable.insert()
+            print(f"created constable: {badge} -> {c['station']}")
+        elif constable.station_id != station.id:
+            constable.station_id = station.id
+            await constable.save()
+            print(f"updated constable station: {badge} -> {c['station']}")
 
-        hashed_pwd = hash_password(TEST_PASSWORD)
-        for c in CONSTABLES:
-            badge = f"Constable Test {c['n']:02d}"
-            device_identifier = f"{TEST_DEVICE_PREFIX}{c['n']:03d}"
-            station = stations_by_name[c["station"]]
+        device = await Device.find_one(Device.device_identifier == device_identifier)
+        if not device:
+            device = Device(
+                constable_id=constable.id,
+                device_identifier=device_identifier,
+                platform="android",
+                status=DeviceStatus.offline,
+            )
+            await device.insert()
+            print(f"created device: {device_identifier} -> {badge}")
+        elif device.constable_id != constable.id:
+            device.constable_id = constable.id
+            await device.save()
+            print(f"updated device association: {device_identifier} -> {badge}")
 
-            user = db.query(User).filter(User.phone == c["phone"]).first()
-            if not user:
-                user = User(phone=c["phone"], role=UserRole.constable, status=UserStatus.active, hashed_password=hashed_pwd)
-                db.add(user)
-                db.flush()
-                print(f"created user: {c['phone']} (role=constable)")
-
-            constable = db.query(Constable).filter(Constable.user_id == user.id).first()
-            if not constable:
-                constable = Constable(
-                    user_id=user.id,
-                    badge_number=badge,
-                    station_id=station.id,
-                    status=ConstableStatus.offline,
-                )
-                db.add(constable)
-                db.flush()
-                print(f"created constable: {badge} -> {c['station']}")
-            elif constable.station_id != station.id:
-                constable.station_id = station.id
-                print(f"updated constable station: {badge} -> {c['station']}")
-
-            device = db.query(Device).filter(Device.device_identifier == device_identifier).first()
-            if not device:
-                device = Device(
-                    constable_id=constable.id,
-                    device_identifier=device_identifier,
-                    platform="android",
-                    status=DeviceStatus.offline,
-                )
-                db.add(device)
-                print(f"created device: {device_identifier} -> {badge}")
-            elif device.constable_id != constable.id:
-                device.constable_id = constable.id
-                print(f"updated device association: {device_identifier} -> {badge}")
-
-        db.commit()
-        print(f"\nTest data seeded. Password for all 5 test constables: {TEST_PASSWORD}")
-    finally:
-        db.close()
+    print(f"\nTest data seeded. Password for all 5 test constables: {TEST_PASSWORD}")
 
 
-def reset():
+async def reset():
     """Deletes ONLY rows matching this script's own test markers -- never
     touches seed_demo.py's accounts or any other data."""
-    db = SessionLocal()
-    try:
-        devices = db.query(Device).filter(Device.device_identifier.like(f"{TEST_DEVICE_PREFIX}%")).all()
-        for d in devices:
-            db.delete(d)
-        print(f"removed {len(devices)} test device(s)")
+    await init_db()
 
-        users = db.query(User).filter(User.phone.like(f"{TEST_PHONE_PREFIX}%")).all()
-        for u in users:
-            constable = db.query(Constable).filter(Constable.user_id == u.id).first()
-            if constable:
-                db.delete(constable)
-            db.delete(u)
-        print(f"removed {len(users)} test constable/user pair(s)")
+    devices = await Device.find({"device_identifier": {"$regex": f"^{TEST_DEVICE_PREFIX}"}}).to_list()
+    for d in devices:
+        await d.delete()
+    print(f"removed {len(devices)} test device(s)")
 
-        stations = db.query(PoliceStation).filter(PoliceStation.name.in_(TEST_STATION_NAMES)).all()
-        for s in stations:
-            db.delete(s)
-        print(f"removed {len(stations)} test station(s)")
+    users = await User.find({"phone": {"$regex": f"^{TEST_PHONE_PREFIX}"}}).to_list()
+    for u in users:
+        constable = await Constable.find_one(Constable.user_id == u.id)
+        if constable:
+            await constable.delete()
+        await u.delete()
+    print(f"removed {len(users)} test constable/user pair(s)")
 
-        db.commit()
-        print("\nTest data reset complete.")
-    finally:
-        db.close()
+    stations = await PoliceStation.find({"name": {"$in": TEST_STATION_NAMES}}).to_list()
+    for s in stations:
+        await s.delete()
+    print(f"removed {len(stations)} test station(s)")
+
+    print("\nTest data reset complete.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reset", action="store_true", help="remove the test data created by this script instead of creating it")
     args = parser.parse_args()
-    reset() if args.reset else seed()
+    asyncio.run(reset() if args.reset else seed())

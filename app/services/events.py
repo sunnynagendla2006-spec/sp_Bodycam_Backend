@@ -82,7 +82,7 @@ async def publish_incident_dispatched(
         await manager.send_to_constable(constable_id, build_event("assignment.created", assignment_payload))
 
 
-async def publish_assignment_accepted(assignment: models.IncidentAssignment, incident: models.Incident):
+async def publish_assignment_accepted(assignment: models.Assignment, incident: models.Incident):
     payload = {
         "incident_id": str(incident.id),
         "display_id": incident.display_id,
@@ -95,7 +95,7 @@ async def publish_assignment_accepted(assignment: models.IncidentAssignment, inc
     await manager.send_to_station(incident.station_id, event)
 
 
-async def publish_assignment_rejected(assignment: models.IncidentAssignment, incident: models.Incident):
+async def publish_assignment_rejected(assignment: models.Assignment, incident: models.Incident):
     payload = {
         "incident_id": str(incident.id),
         "display_id": incident.display_id,
@@ -108,7 +108,7 @@ async def publish_assignment_rejected(assignment: models.IncidentAssignment, inc
     await manager.send_to_station(incident.station_id, event)
 
 
-async def publish_assignment_status_changed(assignment: models.IncidentAssignment, incident: models.Incident):
+async def publish_assignment_status_changed(assignment: models.Assignment, incident: models.Incident):
     payload = {
         "incident_id": str(incident.id),
         "display_id": incident.display_id,

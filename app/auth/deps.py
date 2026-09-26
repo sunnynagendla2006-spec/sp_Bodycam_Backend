@@ -34,9 +34,8 @@ from typing import Iterable
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
-from sqlalchemy.orm import Session
 
-from .. import database, models
+from .. import models
 from .security import decode_access_token
 
 # Using HTTPBearer (rather than OAuth2PasswordBearer's form-encoded flow)
@@ -52,9 +51,8 @@ _AUTH_FAILED = HTTPException(
 )
 
 
-def get_current_user(
+async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-    db: Session = Depends(database.get_db),
 ) -> models.User:
     """
     Extract and validate the Bearer token, then load and return the
@@ -77,7 +75,7 @@ def get_current_user(
     except (ValueError, AttributeError, TypeError):
         raise _AUTH_FAILED
 
-    user = db.query(models.User).filter(models.User.id == user_id).first()
+    user = await models.User.get(user_id)
     if user is None:
         raise _AUTH_FAILED
 

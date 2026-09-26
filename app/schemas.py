@@ -289,10 +289,9 @@ class ConstableStatusUpdateRequest(BaseModel):
 
 class AuditLogResponse(BaseModel):
     """
-    Safe, API-facing view of an AuditLog row. `details` is parsed from the
-    JSON-serialized string stored in the DB back into a dict; never
-    contains passwords/JWTs/file paths (enforced at write time by
-    app/services/audit.py, not by this schema).
+    Safe, API-facing view of an AuditLog row. `details` is a native
+    embedded document -- never contains passwords/JWTs/file paths
+    (enforced at write time by app/services/audit.py, not by this schema).
     """
     id: uuid.UUID
     user_id: Optional[uuid.UUID] = None
@@ -306,18 +305,11 @@ class AuditLogResponse(BaseModel):
 
     @classmethod
     def from_audit_log(cls, entry) -> "AuditLogResponse":
-        import json
-        parsed_details = None
-        if entry.details:
-            try:
-                parsed_details = json.loads(entry.details)
-            except (ValueError, TypeError):
-                parsed_details = {"raw": entry.details}
         return cls(
             id=entry.id,
             user_id=entry.user_id,
             action=entry.action,
-            details=parsed_details,
+            details=entry.details,
             incident_id=entry.incident_id,
             evidence_id=entry.evidence_id,
             ip_address=entry.ip_address,

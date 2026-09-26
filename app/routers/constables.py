@@ -1,15 +1,17 @@
 import os
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
-from sqlalchemy import func
-from pydantic import BaseModel
+import re
+import uuid
+import datetime
 from typing import Optional
-from .. import database, models, schemas
+
+from beanie.operators import In
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
+
+from .. import geo, models, schemas
 from ..auth.deps import get_current_user, require_role
 from ..services.audit import log_action
 from ..services import events
-import uuid
-import datetime
 
 router = APIRouter(prefix="/constables", tags=["Constables"])
 
@@ -20,15 +22,7 @@ router = APIRouter(prefix="/constables", tags=["Constables"])
 # reliably available for emergency dispatch (see incidents.py::dispatch_incident).
 CONSTABLE_LOCATION_MAX_AGE_SECONDS = int(os.getenv("CONSTABLE_LOCATION_MAX_AGE_SECONDS", "120"))
 
-# Assignment states that count as "this constable is already busy with
-# something" -- used both to block dispatching an already-committed
-# constable and to block a constable from having two active assignments.
-ACTIVE_ASSIGNMENT_STATUSES = (
-    models.AssignmentStatus.pending,
-    models.AssignmentStatus.accepted,
-    models.AssignmentStatus.en_route,
-    models.AssignmentStatus.arrived,
-)
+ACTIVE_ASSIGNMENT_STATUSES = models.ACTIVE_ASSIGNMENT_STATUSES
 
 # Legal constable-driven assignment transitions for PUT /constables/me/incidents/{id}/status.
 # accept/reject (pending -> accepted/rejected) are handled by their own dedicated endpoints,
@@ -51,51 +45,53 @@ _ASSIGNMENT_TO_INCIDENT_STATUS = {
 }
 
 
-def get_own_constable(db: Session, user: models.User):
+async def get_own_constable(user: models.User) -> Optional[models.Constable]:
     """
-    Resolve the Constable row that belongs to the given authenticated User.
-    Shared by constables.py, incidents.py, and media.py so that "which
-    constable is this?" is always derived from the authenticated identity,
-    never from a client-supplied constable_id.
+    Resolve the Constable document that belongs to the given authenticated
+    User. Shared by constables.py, incidents.py, and media.py so that
+    "which constable is this?" is always derived from the authenticated
+    identity, never from a client-supplied constable_id.
     """
-    return db.query(models.Constable).filter(models.Constable.user_id == user.id).first()
+    return await models.Constable.find_one(models.Constable.user_id == user.id)
 
 
-def _require_own_constable(db: Session, current_user: models.User) -> models.Constable:
+async def _require_own_constable(current_user: models.User) -> models.Constable:
     if current_user.role != models.UserRole.constable:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Constable role required")
-    constable = get_own_constable(db, current_user)
+    constable = await get_own_constable(current_user)
     if not constable:
         raise HTTPException(status_code=404, detail="Constable profile not found")
     return constable
+
+
+def _find_assignment(incident: models.Incident, constable_id: uuid.UUID) -> Optional[models.Assignment]:
+    """Most recent assignment belonging to this constable on this incident (mirrors the old per-incident FK-scoped lookup)."""
+    matches = [a for a in incident.assignments if a.constable_id == constable_id]
+    return max(matches, key=lambda a: a.assigned_at) if matches else None
+
+
+def _clear_active_if_matches(incident: models.Incident, assignment_id: uuid.UUID) -> None:
+    if incident.active_assignment_id == assignment_id:
+        incident.active_assignment_id = None
 
 
 # ===========================================================================
 # Constable self-service ("/me") endpoints.
 #
 # IMPORTANT ROUTING NOTE: these are registered BEFORE the "/{constable_id}/..."
-# routes further down in this file. FastAPI/Starlette match path templates by
-# registration order using plain string segments (the uuid.UUID conversion
-# only happens during parameter binding, AFTER a route already matched) --
-# so if "/{constable_id}/location" were registered first, a request to
-# "/constables/me/location" would match THAT route with constable_id="me"
-# and fail UUID validation with a 422, never reaching the real /me handler.
-# Keeping literal "/me" routes first avoids that entirely.
+# routes further down in this file -- see original module docstring for why
+# (literal "/me" must be matched before the "/{constable_id}" pattern).
 # ===========================================================================
 
 @router.get("/me", response_model=schemas.ConstableMeResponse)
-def get_my_constable_profile(
-    db: Session = Depends(database.get_db),
+async def get_my_constable_profile(
     current_user: models.User = Depends(get_current_user),
 ):
     """Authenticated constable's own profile. 403 if the caller isn't a constable."""
-    constable = _require_own_constable(db, current_user)
-    last_location = (
-        db.query(models.ConstableLocation)
-        .filter(models.ConstableLocation.constable_id == constable.id)
-        .order_by(models.ConstableLocation.timestamp.desc())
-        .first()
-    )
+    constable = await _require_own_constable(current_user)
+    last_location = await models.ConstableLocation.find(
+        models.ConstableLocation.constable_id == constable.id
+    ).sort(-models.ConstableLocation.timestamp).first_or_none()
     return schemas.ConstableMeResponse(
         id=constable.id,
         user_id=constable.user_id,
@@ -110,10 +106,9 @@ def get_my_constable_profile(
 
 
 @router.get("/me/incidents", response_model=list[schemas.ConstableIncidentResponse])
-def list_my_incidents(
+async def list_my_incidents(
     incident_status: Optional[str] = None,
     assignment_status: Optional[str] = None,
-    db: Session = Depends(database.get_db),
     current_user: models.User = Depends(get_current_user),
 ):
     """
@@ -122,68 +117,76 @@ def list_my_incidents(
     status and/or assignment status; no pagination, matching the rest of
     this API's current (unpaginated) style.
     """
-    constable = _require_own_constable(db, current_user)
+    constable = await _require_own_constable(current_user)
 
-    query = (
-        db.query(models.Incident, models.IncidentAssignment)
-        .join(models.IncidentAssignment, models.IncidentAssignment.incident_id == models.Incident.id)
-        .filter(models.IncidentAssignment.constable_id == constable.id)
-    )
-
+    match: dict = {"assignments.constable_id": constable.id}
     if incident_status:
         try:
-            query = query.filter(models.Incident.status == models.IncidentStatus(incident_status))
+            match["status"] = models.IncidentStatus(incident_status).value
         except ValueError:
             raise HTTPException(status_code=422, detail=f"Invalid incident_status: {incident_status}")
 
+    element_match: dict = {"assignments.constable_id": constable.id}
     if assignment_status:
         try:
-            query = query.filter(models.IncidentAssignment.status == models.AssignmentStatus(assignment_status))
+            element_match["assignments.status"] = models.AssignmentStatus(assignment_status).value
         except ValueError:
             raise HTTPException(status_code=422, detail=f"Invalid assignment_status: {assignment_status}")
 
-    rows = query.order_by(models.IncidentAssignment.assigned_at.desc()).all()
+    pipeline = [
+        {"$match": match},
+        {"$unwind": "$assignments"},
+        {"$match": element_match},
+        {"$sort": {"assignments.assigned_at": -1}},
+    ]
 
     results = []
-    for incident, assignment in rows:
-        loc_str = None
-        try:
-            loc_str = db.query(func.ST_AsText(models.Incident.location)).filter(models.Incident.id == incident.id).scalar()
-        except Exception:
-            loc_str = None
+    async for doc in models.Incident.get_motor_collection().aggregate(pipeline):
+        a = doc["assignments"]
+        location = models.GeoPoint(**doc["location"]) if doc.get("location") else None
         results.append(schemas.ConstableIncidentResponse(
-            incident_id=incident.id,
-            display_id=incident.display_id,
-            incident_status=incident.status,
-            location=loc_str,
-            created_at=incident.created_at,
-            assignment_id=assignment.id,
-            assignment_status=assignment.status,
-            assigned_at=assignment.assigned_at,
+            incident_id=doc["_id"],
+            display_id=doc.get("display_id"),
+            incident_status=doc["status"],
+            location=geo.to_wkt(location),
+            created_at=doc["created_at"],
+            assignment_id=a["id"],
+            assignment_status=a["status"],
+            assigned_at=a["assigned_at"],
         ))
     return results
 
 
 @router.get("/me/assignments", response_model=list[schemas.AssignmentResponse])
-def list_my_assignments(
-    db: Session = Depends(database.get_db),
+async def list_my_assignments(
     current_user: models.User = Depends(get_current_user),
 ):
     """Raw assignment records for the authenticated constable (assignment-centric view; see /me/incidents for the incident-enriched view)."""
-    constable = _require_own_constable(db, current_user)
-    assignments = (
-        db.query(models.IncidentAssignment)
-        .filter(models.IncidentAssignment.constable_id == constable.id)
-        .order_by(models.IncidentAssignment.assigned_at.desc())
-        .all()
-    )
-    return assignments
+    constable = await _require_own_constable(current_user)
+    pipeline = [
+        {"$match": {"assignments.constable_id": constable.id}},
+        {"$unwind": "$assignments"},
+        {"$match": {"assignments.constable_id": constable.id}},
+        {"$sort": {"assignments.assigned_at": -1}},
+    ]
+    results = []
+    async for doc in models.Incident.get_motor_collection().aggregate(pipeline):
+        a = doc["assignments"]
+        results.append(schemas.AssignmentResponse(
+            id=a["id"],
+            incident_id=doc["_id"],
+            constable_id=a["constable_id"],
+            status=a["status"],
+            assigned_at=a["assigned_at"],
+            responded_at=a.get("responded_at"),
+            closed_at=a.get("closed_at"),
+        ))
+    return results
 
 
 @router.post("/me/incidents/{incident_id}/accept", response_model=schemas.AssignmentActionResponse)
 async def accept_assignment(
     incident_id: uuid.UUID,
-    db: Session = Depends(database.get_db),
     current_user: models.User = Depends(get_current_user),
 ):
     """
@@ -192,37 +195,30 @@ async def accept_assignment(
     isn't one to find, since the lookup is scoped to constable.id), and
     cannot accept anything already accepted/rejected/en_route/etc.
     """
-    constable = _require_own_constable(db, current_user)
-    assignment = (
-        db.query(models.IncidentAssignment)
-        .filter(
-            models.IncidentAssignment.incident_id == incident_id,
-            models.IncidentAssignment.constable_id == constable.id,
-        )
-        .first()
-    )
+    constable = await _require_own_constable(current_user)
+    incident = await models.Incident.get(incident_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+
+    assignment = _find_assignment(incident, constable.id)
     if not assignment:
         raise HTTPException(status_code=404, detail="Assignment not found")
     if assignment.status != models.AssignmentStatus.pending:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Assignment is not pending")
-
-    incident = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
-    if not incident or incident.status != models.IncidentStatus.assigned:
+    if incident.status != models.IncidentStatus.assigned:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Incident is no longer in a dispatchable state")
 
     assignment.status = models.AssignmentStatus.accepted
     assignment.responded_at = datetime.datetime.now(datetime.timezone.utc)
+    await incident.save()
 
-    log_action(
-        db,
+    await log_action(
         user_id=current_user.id,
         action="assignment.accepted",
         incident_id=incident.id,
         details={"assignment_id": str(assignment.id), "constable_id": str(constable.id)},
     )
 
-    db.commit()
-    db.refresh(assignment)
     await events.publish_assignment_accepted(assignment, incident)
     return schemas.AssignmentActionResponse(status="accepted", assignment_id=assignment.id, assignment_status=assignment.status)
 
@@ -231,7 +227,6 @@ async def accept_assignment(
 async def reject_assignment(
     incident_id: uuid.UUID,
     payload: schemas.IncidentActionReason = schemas.IncidentActionReason(),
-    db: Session = Depends(database.get_db),
     current_user: models.User = Depends(get_current_user),
 ):
     """
@@ -240,15 +235,12 @@ async def reject_assignment(
     `verified`) for Control Room to dispatch to someone else -- this phase
     does NOT auto-reassign.
     """
-    constable = _require_own_constable(db, current_user)
-    assignment = (
-        db.query(models.IncidentAssignment)
-        .filter(
-            models.IncidentAssignment.incident_id == incident_id,
-            models.IncidentAssignment.constable_id == constable.id,
-        )
-        .first()
-    )
+    constable = await _require_own_constable(current_user)
+    incident = await models.Incident.get(incident_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+
+    assignment = _find_assignment(incident, constable.id)
     if not assignment:
         raise HTTPException(status_code=404, detail="Assignment not found")
     if assignment.status != models.AssignmentStatus.pending:
@@ -256,25 +248,23 @@ async def reject_assignment(
 
     assignment.status = models.AssignmentStatus.rejected
     assignment.responded_at = datetime.datetime.now(datetime.timezone.utc)
+    _clear_active_if_matches(incident, assignment.id)
 
     constable.status = models.ConstableStatus.available
+    await constable.save()
 
-    incident = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
-    if incident and incident.status == models.IncidentStatus.assigned:
+    if incident.status == models.IncidentStatus.assigned:
         incident.status = models.IncidentStatus.verified  # reopen for reassignment
+    await incident.save()
 
-    log_action(
-        db,
+    await log_action(
         user_id=current_user.id,
         action="assignment.rejected",
         incident_id=incident_id,
         details={"assignment_id": str(assignment.id), "constable_id": str(constable.id), "reason": payload.reason},
     )
 
-    db.commit()
-    db.refresh(assignment)
-    if incident:
-        await events.publish_assignment_rejected(assignment, incident)
+    await events.publish_assignment_rejected(assignment, incident)
     return schemas.AssignmentActionResponse(status="rejected", assignment_id=assignment.id, assignment_status=assignment.status)
 
 
@@ -282,7 +272,6 @@ async def reject_assignment(
 async def update_my_assignment_status(
     incident_id: uuid.UUID,
     payload: schemas.ConstableStatusUpdateRequest,
-    db: Session = Depends(database.get_db),
     current_user: models.User = Depends(get_current_user),
 ):
     """
@@ -291,7 +280,7 @@ async def update_my_assignment_status(
     endpoint (those aren't even valid AssignmentStatus values) -- those
     remain exclusively Control-Room actions via POST /incidents/{id}/verify|reject.
     """
-    constable = _require_own_constable(db, current_user)
+    constable = await _require_own_constable(current_user)
 
     try:
         requested = models.AssignmentStatus(payload.status)
@@ -301,14 +290,10 @@ async def update_my_assignment_status(
     if requested not in (models.AssignmentStatus.en_route, models.AssignmentStatus.arrived, models.AssignmentStatus.completed):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to set this status")
 
-    assignment = (
-        db.query(models.IncidentAssignment)
-        .filter(
-            models.IncidentAssignment.incident_id == incident_id,
-            models.IncidentAssignment.constable_id == constable.id,
-        )
-        .first()
-    )
+    incident = await models.Incident.get(incident_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    assignment = _find_assignment(incident, constable.id)
     if not assignment:
         raise HTTPException(status_code=404, detail="Assignment not found")
 
@@ -321,16 +306,17 @@ async def update_my_assignment_status(
 
     old_assignment_status = assignment.status.value
     assignment.status = requested
-    incident = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
 
     if requested == models.AssignmentStatus.completed:
         assignment.closed_at = datetime.datetime.now(datetime.timezone.utc)
+        _clear_active_if_matches(incident, assignment.id)
         constable.status = models.ConstableStatus.available  # restore availability
-    if incident and requested in _ASSIGNMENT_TO_INCIDENT_STATUS:
+        await constable.save()
+    if requested in _ASSIGNMENT_TO_INCIDENT_STATUS:
         incident.status = _ASSIGNMENT_TO_INCIDENT_STATUS[requested]
+    await incident.save()
 
-    log_action(
-        db,
+    await log_action(
         user_id=current_user.id,
         action="assignment.status_changed",
         incident_id=incident_id,
@@ -342,50 +328,37 @@ async def update_my_assignment_status(
         },
     )
 
-    db.commit()
-    db.refresh(assignment)
-    if incident:
-        await events.publish_assignment_status_changed(assignment, incident)
+    await events.publish_assignment_status_changed(assignment, incident)
     return schemas.AssignmentActionResponse(status="updated", assignment_id=assignment.id, assignment_status=assignment.status)
 
 
 @router.post("/me/location", response_model=schemas.ConstableLocationResponse)
 async def update_my_location(
     payload: schemas.ConstableMeLocationUpdate,
-    db: Session = Depends(database.get_db),
     current_user: models.User = Depends(get_current_user),
 ):
     """
     Flutter-facing location endpoint: constable identity comes ENTIRELY
     from the JWT via _require_own_constable -- there is no constable_id in
-    the request at all, so there is nothing to spoof. Coordinate range
-    validation happens declaratively on schemas.ConstableMeLocationUpdate
-    (returns 422 automatically for out-of-range values). Uses the server
+    the request at all, so there is nothing to spoof. Uses the server
     timestamp as the authoritative received time -- no client timestamp is
-    accepted here. Does NOT touch User.last_login (see module docstring /
-    phase report: last_login is an authentication concept, not a location
-    concept, and the older admin-facing endpoint's coupling of the two was
-    a bug, fixed below).
+    accepted here. Does NOT touch User.last_login (an authentication
+    concept, not a location concept).
     """
-    constable = _require_own_constable(db, current_user)
+    constable = await _require_own_constable(current_user)
 
-    location_str = f"POINT({payload.longitude} {payload.latitude})"
     new_location = models.ConstableLocation(
         constable_id=constable.id,
-        location=location_str,
+        location=geo.point(payload.longitude, payload.latitude),
         accuracy=payload.accuracy,
     )
-    db.add(new_location)
+    await new_location.insert()
 
-    log_action(
-        db,
+    await log_action(
         user_id=current_user.id,
         action="constable.location_updated",
         details={"constable_id": str(constable.id), "accuracy": payload.accuracy},
     )
-
-    db.commit()
-    db.refresh(new_location)
 
     await events.publish_constable_location_updated(
         constable.id, constable.station_id, payload.latitude, payload.longitude, payload.accuracy
@@ -402,53 +375,33 @@ async def update_my_location(
 
 
 # ===========================================================================
-# Existing administrative / parameterized-path endpoints (unchanged
-# authorization model from Phase 2, with station-scoping added where the
-# new User.station_id linkage now makes it possible -- see Phase 4 report).
+# Existing administrative / parameterized-path endpoints.
 # ===========================================================================
 
 @router.post("/{constable_id}/location")
 async def update_location(
     constable_id: uuid.UUID,
     location_data: schemas.ConstableLocationUpdate,
-    db: Session = Depends(database.get_db),
     current_user: models.User = Depends(get_current_user),
 ):
     """
     Legacy/administrative location endpoint. Kept for backward
     compatibility; Flutter should use POST /constables/me/location instead
-    (see module docstring above) so identity always comes from the JWT.
+    so identity always comes from the JWT.
 
     Critical ownership check: a constable may only update THEIR OWN
     location -- the path's constable_id is only used to verify it matches
     their own derived constable id, never trusted as proof of identity.
     admin/control_room may submit an administrative override for any
     constable.
-
-    NOTE (Phase 4 fix): this endpoint previously updated User-adjacent
-    `last_login` on every GPS ping, incorrectly conflating "last time we
-    heard a location ping" with "last time this user authenticated". That
-    coupling has been removed -- `Constable.last_login` is no longer
-    touched here at all; `ConstableLocation.timestamp` is the correct
-    "last seen" signal (see get_own_constable/list endpoints and
-    incidents.py's freshness check).
-
-    NOTE (Phase 5 fix): this endpoint previously fired its WebSocket
-    broadcast via `asyncio.create_task(manager.broadcast(...))` inside what
-    was then a sync `def` handler -- with no running event loop in that
-    context, `create_task` would raise, and the bare `except Exception:
-    pass` around it silently swallowed that every time, so the broadcast
-    never actually happened. This is now a proper `async def` that awaits
-    the same role-scoped event-publishing helper used by
-    POST /constables/me/location.
     """
-    target_constable = db.query(models.Constable).filter(models.Constable.id == constable_id).first()
+    target_constable = await models.Constable.get(constable_id)
     if not target_constable:
         raise HTTPException(status_code=404, detail="Constable not found")
 
     role = current_user.role
     if role == models.UserRole.constable:
-        own_constable = get_own_constable(db, current_user)
+        own_constable = await get_own_constable(current_user)
         if not own_constable or own_constable.id != constable_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -459,26 +412,21 @@ async def update_location(
     else:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to update constable location")
 
-    location_str = f"POINT({location_data.location_lon} {location_data.location_lat})"
     new_location = models.ConstableLocation(
         constable_id=constable_id,
-        location=location_str
+        location=geo.point(location_data.location_lon, location_data.location_lat),
     )
-    db.add(new_location)
+    await new_location.insert()
 
     if location_data.battery_level is not None:
-        db.query(models.Constable).filter(models.Constable.id == constable_id).update(
-            {"battery_level": location_data.battery_level}
-        )
+        target_constable.battery_level = location_data.battery_level
+        await target_constable.save()
 
-    log_action(
-        db,
+    await log_action(
         user_id=current_user.id,
         action="constable.location_updated",
         details={"constable_id": str(constable_id), "battery_level": location_data.battery_level, "via": "admin_endpoint"},
     )
-
-    db.commit()
 
     await events.publish_constable_location_updated(
         constable_id, target_constable.station_id, location_data.location_lat, location_data.location_lon, None
@@ -492,78 +440,77 @@ class ConstableCreate(BaseModel):
     badge_number: str
 
 @router.post("/")
-def create_constable(
+async def create_constable(
     req: ConstableCreate,
-    db: Session = Depends(database.get_db),
     current_user: models.User = Depends(require_role("admin")),
 ):
     new_user = models.User(phone=req.phone, role=models.UserRole.constable)
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
+    await new_user.insert()
     new_constable = models.Constable(user_id=new_user.id, badge_number=req.badge_number, status=models.ConstableStatus.available, battery_level=100)
-    db.add(new_constable)
-    db.commit()
-    db.refresh(new_constable)
+    await new_constable.insert()
     return {"id": str(new_constable.id)}
 
 @router.delete("/{constable_id}")
-def delete_constable(
+async def delete_constable(
     constable_id: uuid.UUID,
-    db: Session = Depends(database.get_db),
     current_user: models.User = Depends(require_role("admin")),
 ):
-    constable = db.query(models.Constable).filter(models.Constable.id == constable_id).first()
-    if not constable: raise HTTPException(status_code=404)
-    db.delete(constable)
-    db.commit()
+    constable = await models.Constable.get(constable_id)
+    if not constable:
+        raise HTTPException(status_code=404)
+    await constable.delete()
     return {"status": "deleted"}
 
 @router.get("/")
-def list_constables(
-    db: Session = Depends(database.get_db),
+async def list_constables(
     current_user: models.User = Depends(get_current_user),
 ):
     """
     admin/control_room: full roster.
-    station: scoped to constables at their own station (via the new
+    station: scoped to constables at their own station (via the
     User.station_id -> Constable.station_id linkage). A station user with
     no station_id set gets an empty list (safe default), not an error.
     Any other role: 403.
     """
     role = current_user.role
-    query = db.query(models.Constable)
 
     if role in (models.UserRole.admin, models.UserRole.control_room):
-        pass
+        constables = await models.Constable.find_all().to_list()
     elif role == models.UserRole.station:
         if not current_user.station_id:
             return []
-        query = query.filter(models.Constable.station_id == current_user.station_id)
+        constables = await models.Constable.find(models.Constable.station_id == current_user.station_id).to_list()
     else:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to list constables")
 
-    constables = query.all()
     # Batch-fetched (not one query per constable) so the Live Map's roster
-    # call stays O(1) queries for station names regardless of roster size --
-    # station_id/station_name were previously missing from this response
-    # entirely, which is the one genuine gap the Live Map identity work
-    # needs filled (see routers/devices.py's DeviceResponse, which already
-    # has everything else: constable_id, latitude/longitude, status,
-    # location_updated_at).
+    # call stays O(1) queries for station names/users/active-assignments
+    # regardless of roster size.
     station_ids = {c.station_id for c in constables if c.station_id}
     stations_by_id = {}
     if station_ids:
-        for s in db.query(models.PoliceStation).filter(models.PoliceStation.id.in_(station_ids)).all():
+        for s in await models.PoliceStation.find(In(models.PoliceStation.id, list(station_ids))).to_list():
             stations_by_id[s.id] = s.name
+
+    user_ids = [c.user_id for c in constables if c.user_id]
+    users_by_id = {}
+    if user_ids:
+        for u in await models.User.find(In(models.User.id, user_ids)).to_list():
+            users_by_id[u.id] = u
+
+    active_pipeline = [
+        {"$unwind": "$assignments"},
+        {"$match": {"assignments.status": {"$in": [s.value for s in ACTIVE_ASSIGNMENT_STATUSES]}}},
+        {"$group": {"_id": "$assignments.constable_id", "incident_id": {"$first": "$_id"}}},
+    ]
+    active_incident_by_constable = {}
+    async for doc in models.Incident.get_motor_collection().aggregate(active_pipeline):
+        active_incident_by_constable[doc["_id"]] = doc["incident_id"]
 
     results = []
     for c in constables:
-        user = db.query(models.User).filter(models.User.id == c.user_id).first()
-        task = db.query(models.IncidentAssignment).filter(
-            models.IncidentAssignment.constable_id == c.id,
-            models.IncidentAssignment.status.in_(ACTIVE_ASSIGNMENT_STATUSES),
-        ).first()
+        user = users_by_id.get(c.user_id)
+        task_incident_id = active_incident_by_constable.get(c.id)
         results.append({
             "id": str(c.id),
             "user_id": str(c.user_id),
@@ -572,7 +519,7 @@ def list_constables(
             "phone": user.phone if user else None,
             "last_login": c.last_login.isoformat() if c.last_login else None,
             "battery_level": c.battery_level,
-            "assigned_task": str(task.incident_id) if task else None,
+            "assigned_task": str(task_incident_id) if task_incident_id else None,
             "station_id": str(c.station_id) if c.station_id else None,
             "station_name": stations_by_id.get(c.station_id),
         })
@@ -582,54 +529,62 @@ class AssignTaskRequest(BaseModel):
     incident_id: str
 
 @router.post("/{constable_id}/tasks")
-def assign_task(
+async def assign_task(
     constable_id: uuid.UUID,
     req: AssignTaskRequest,
-    db: Session = Depends(database.get_db),
     current_user: models.User = Depends(require_role("admin", "control_room")),
 ):
     """Only admin/control_room may assign tasks -- a constable can never assign themselves or another constable."""
     incident = None
     try:
         inc_uuid = uuid.UUID(req.incident_id)
-        incident = db.query(models.Incident).filter(models.Incident.id == inc_uuid).first()
+        incident = await models.Incident.get(inc_uuid)
     except ValueError:
-        incident = db.query(models.Incident).filter(models.Incident.display_id == req.incident_id).first()
-        
+        incident = await models.Incident.find_one(models.Incident.display_id == req.incident_id)
+
     if not incident:
         # If still not found, check if they passed just the first part (e.g., 123 from INC-123)
-        # For prototype flexibility, we can just create a dummy assignment or let it fail
-        # Or search by prefix
-        incident = db.query(models.Incident).filter(models.Incident.display_id.startswith(req.incident_id)).first()
-        
+        incident = await models.Incident.find_one({"display_id": {"$regex": f"^{re.escape(req.incident_id)}"}})
+
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
-        
-    assignment = models.IncidentAssignment(constable_id=constable_id, incident_id=incident.id)
-    db.add(assignment)
-    db.query(models.Constable).filter(models.Constable.id == constable_id).update({"status": models.ConstableStatus.busy})
-    db.commit()
+
+    assignment = models.Assignment(constable_id=constable_id)
+    incident.assignments.append(assignment)
+    incident.active_assignment_id = assignment.id
+    await incident.save()
+
+    constable = await models.Constable.get(constable_id)
+    if constable:
+        constable.status = models.ConstableStatus.busy
+        await constable.save()
+
     return {"status": "assigned"}
 
 @router.delete("/{constable_id}/tasks/{incident_id}")
-def unassign_task(
+async def unassign_task(
     constable_id: uuid.UUID,
     incident_id: uuid.UUID,
-    db: Session = Depends(database.get_db),
     current_user: models.User = Depends(require_role("admin", "control_room")),
 ):
     """Only admin/control_room may unassign tasks -- same rationale as assign_task above."""
-    db.query(models.IncidentAssignment).filter(
-        models.IncidentAssignment.constable_id == constable_id,
-        models.IncidentAssignment.incident_id == incident_id
-    ).delete()
-    db.query(models.Constable).filter(models.Constable.id == constable_id).update({"status": models.ConstableStatus.available})
-    db.commit()
+    incident = await models.Incident.get(incident_id)
+    if incident:
+        removed_ids = {a.id for a in incident.assignments if a.constable_id == constable_id}
+        incident.assignments = [a for a in incident.assignments if a.constable_id != constable_id]
+        if incident.active_assignment_id in removed_ids:
+            incident.active_assignment_id = None
+        await incident.save()
+
+    constable = await models.Constable.get(constable_id)
+    if constable:
+        constable.status = models.ConstableStatus.available
+        await constable.save()
+
     return {"status": "unassigned"}
 
 @router.get("/locations")
-def list_constable_locations(
-    db: Session = Depends(database.get_db),
+async def list_constable_locations(
     current_user: models.User = Depends(get_current_user),
 ):
     """
@@ -643,48 +598,31 @@ def list_constable_locations(
     if role not in (models.UserRole.admin, models.UserRole.control_room, models.UserRole.station):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to view constable locations")
 
-    # "Latest location per constable" via GROUP BY + MAX(timestamp) +
-    # join-back, matching incidents.py::dispatch_incident's approach --
-    # NOT the previous `.order_by(...).distinct(constable_id)` (Postgres
-    # DISTINCT ON), which SQLAlchemy silently ignores on non-Postgres
-    # dialects (flagged as deprecated, will become a hard CompileError in a
-    # future SQLAlchemy version) and would silently return duplicate/wrong
-    # rows for any constable with more than one location row under SQLite.
-    latest_ts_subq = (
-        db.query(
-            models.ConstableLocation.constable_id.label("constable_id"),
-            func.max(models.ConstableLocation.timestamp).label("max_ts"),
-        )
-        .group_by(models.ConstableLocation.constable_id)
-        .subquery()
-    )
-
-    query = (
-        db.query(
-            models.Constable.badge_number,
-            models.Constable.battery_level,
-            func.ST_X(models.ConstableLocation.location).label("lon"),
-            func.ST_Y(models.ConstableLocation.location).label("lat"),
-        )
-        .join(models.Constable, models.ConstableLocation.constable_id == models.Constable.id)
-        .join(
-            latest_ts_subq,
-            (models.ConstableLocation.constable_id == latest_ts_subq.c.constable_id)
-            & (models.ConstableLocation.timestamp == latest_ts_subq.c.max_ts),
-        )
-    )
+    # "Latest location per constable" via $sort + $group ($first) -- the
+    # Mongo equivalent of the old GROUP BY + MAX(timestamp) join-back.
+    pipeline = [
+        {"$sort": {"timestamp": -1}},
+        {"$group": {"_id": "$constable_id", "location": {"$first": "$location"}}},
+    ]
+    latest_by_constable = {}
+    async for doc in models.ConstableLocation.get_motor_collection().aggregate(pipeline):
+        latest_by_constable[doc["_id"]] = doc["location"]
 
     if role == models.UserRole.station:
-        query = query.filter(models.Constable.station_id == current_user.station_id)
+        constables = await models.Constable.find(models.Constable.station_id == current_user.station_id).to_list()
+    else:
+        constables = await models.Constable.find_all().to_list()
 
-    locations = query.all()
-
-    return [
-        {
-            "constable_id": loc.badge_number,
-            "lon": loc.lon,
-            "lat": loc.lat,
-            "battery_level": loc.battery_level
-        }
-        for loc in locations if loc.lon is not None and loc.lat is not None
-    ]
+    results = []
+    for c in constables:
+        loc = latest_by_constable.get(c.id)
+        if not loc:
+            continue
+        lon, lat = loc["coordinates"]
+        results.append({
+            "constable_id": c.badge_number,
+            "lon": lon,
+            "lat": lat,
+            "battery_level": c.battery_level,
+        })
+    return results

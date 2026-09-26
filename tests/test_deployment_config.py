@@ -92,15 +92,15 @@ def test_jwt_tokens_remain_valid_within_the_same_configured_secret(monkeypatch):
         importlib.reload(security_module)
 
 
-def test_authentication_flow_still_works_end_to_end(full_client, make_user):
+async def test_authentication_flow_still_works_end_to_end(full_client, make_user):
     """Full regression guard: the actual login flow (real endpoint, real password hash, real token) still works after these configuration changes."""
     from app.models import UserRole
-    make_user(phone="deploy000001", password="pw", role=UserRole.admin)
-    resp = full_client.post("/auth/login", json={"username": "deploy000001", "password": "pw"})
+    await make_user(phone="deploy000001", password="pw", role=UserRole.admin)
+    resp = await full_client.post("/auth/login", json={"username": "deploy000001", "password": "pw"})
     assert resp.status_code == 200
     token = resp.json()["access_token"]
 
-    me_resp = full_client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    me_resp = await full_client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
     assert me_resp.status_code == 200
     assert me_resp.json()["phone"] == "deploy000001"
 

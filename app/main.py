@@ -1,11 +1,26 @@
 import os
-import sys
-import warnings
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Police Emergency Response API")
+
+# ---------------------------------------------------------------------------
+# Database initialization
+# ---------------------------------------------------------------------------
+# Mongo/Beanie has no separate migration-tool step: `init_db()` registers
+# every Document model and idempotently creates any collection/index that
+# doesn't exist yet (including the partial-unique and 2dsphere indexes
+# declared on each Document's Settings). Safe to run on every startup.
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    from .database import init_db
+
+    await init_db()
+    yield
+
+
+app = FastAPI(title="Police Emergency Response API", lifespan=lifespan)
 
 # ---------------------------------------------------------------------------
 # CORS
@@ -52,77 +67,6 @@ app.include_router(recordings.router)
 app.include_router(commands.router)
 app.include_router(alerts.router)
 app.include_router(live_stream.router)
-
-
-# ---------------------------------------------------------------------------
-# Database schema initialization
-# ---------------------------------------------------------------------------
-# Previously: `models.Base.metadata.create_all(bind=engine)` ran
-# unconditionally at import time. That directly undermines the entire
-# Alembic migration chain this project now relies on (see the migration-
-# repair phase reports): `create_all()` silently creates any table that
-# doesn't exist yet using whatever `models.py` currently says, with no
-# awareness of migration history at all -- so a deployment that never ran
-# `alembic upgrade head` would still appear to "work", masking exactly the
-# kind of schema drift that caused real bugs in earlier phases
-# (`incidents.display_id`, `evidence.comment` were both missing from the
-# migration chain for a long time and this call is *why nobody noticed*).
-#
-# The correct production initialization path is `alembic upgrade head`,
-# run as an explicit deploy/startup step (see Dockerfile). This module no
-# longer creates or alters any schema itself. Instead, it performs a
-# read-only check that the connected database is actually at the expected
-# migration head, and fails loudly (production) or warns loudly
-# (development) if not -- consistent with the same fail-safe pattern
-# already used for JWT_SECRET_KEY in app/auth/security.py.
-def _verify_database_at_expected_migration_head() -> None:
-    from alembic.config import Config
-    from alembic.script import ScriptDirectory
-    from sqlalchemy import text
-    from .database import engine
-
-    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    alembic_ini_path = os.path.join(backend_dir, "alembic.ini")
-
-    try:
-        cfg = Config(alembic_ini_path)
-        cfg.set_main_option("script_location", os.path.join(backend_dir, "alembic"))
-        script = ScriptDirectory.from_config(cfg)
-        expected_heads = set(script.get_heads())
-    except Exception as exc:
-        # Can't even determine the expected head (e.g. alembic.ini missing) --
-        # this is a packaging/deployment problem, not a schema-drift one;
-        # don't block startup over it, just make it visible.
-        warnings.warn(f"Could not resolve expected Alembic head: {exc}", RuntimeWarning)
-        return
-
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(text("SELECT version_num FROM alembic_version")).fetchone()
-        actual_head = row[0] if row else None
-    except Exception as exc:
-        actual_head = None
-        connect_error = str(exc)
-    else:
-        connect_error = None
-
-    if actual_head in expected_heads:
-        return  # database is exactly where the code expects it to be
-
-    environment = os.getenv("ENVIRONMENT", "development").lower()
-    message = (
-        f"Database is NOT at the expected Alembic migration head. "
-        f"Expected one of {expected_heads}, found {actual_head!r}"
-        + (f" (connection/query error: {connect_error})" if connect_error else "")
-        + ". Run `alembic upgrade head` before starting the application."
-    )
-    if environment == "production":
-        raise RuntimeError(message)
-    warnings.warn(message, RuntimeWarning)
-    print(f"WARNING: {message}", file=sys.stderr)
-
-
-_verify_database_at_expected_migration_head()
 
 
 @app.get("/")

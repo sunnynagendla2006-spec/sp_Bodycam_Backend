@@ -1,45 +1,33 @@
 """
 Reusable audit-logging helper.
 
-Transaction-safety design (see Phase 5 report Part 5 for the full
-rationale): `log_action()` only ADDS the AuditLog row to the given
-SQLAlchemy session -- it deliberately does NOT call `db.commit()` itself.
-Every call site adds the audit entry BEFORE the business operation's own
-`db.commit()`, so the audit row and the business change it describes are
-part of the exact same database transaction: either both persist together,
-or (if something fails first) neither does. This avoids two failure modes
-we explicitly want to avoid:
-  - wrapping the audit write in its own blanket try/except that silently
-    swallows a failed audit insert (Part 5 says not to do this for
-    security-sensitive actions)
-  - a separate, later commit for the audit row that could succeed even
-    though the business operation it describes was rolled back, producing
-    a misleading "this happened" record for something that didn't.
-
-The one exception is standalone actions with no other business-state
-change to piggyback on (e.g. a FAILED login attempt) -- those call
-`log_action(...)` followed by their own dedicated `db.commit()`.
+Transaction-safety design: for call sites where the audit row must persist
+atomically together with the business-state change it describes, the
+caller opens `database.transaction()` and passes the resulting session
+through to both writes (see that helper's docstring). Call sites with no
+other business-state change to piggyback on (e.g. a failed login attempt)
+just call `await log_action(...)` on its own -- a single document insert
+is already atomic by itself.
 """
-import json
 import uuid
 from typing import Optional
-
-from sqlalchemy.orm import Session
 
 from .. import models
 
 
-def log_action(
-    db: Session,
+async def log_action(
+    *,
     user_id: Optional[uuid.UUID],
     action: str,
     details: Optional[dict] = None,
     incident_id: Optional[uuid.UUID] = None,
     evidence_id: Optional[uuid.UUID] = None,
     ip_address: Optional[str] = None,
+    session=None,
 ) -> models.AuditLog:
     """
-    Stage an AuditLog row for insertion (added to the session, not committed).
+    Insert an AuditLog document, optionally as part of an in-flight Motor
+    transaction `session` (see database.transaction()).
 
     `user_id`, `action`, `incident_id`, `evidence_id`, `ip_address` must
     always be values the SERVER derived (from the authenticated user, from
@@ -48,16 +36,16 @@ def log_action(
 
     `details` is a plain dict of already-safe, already-vetted values (e.g.
     old_status/new_status/reason/badge numbers) -- NEVER put a password,
-    JWT, raw file bytes, or other secret in here. Serialized to JSON text
-    into the existing `details` String column.
+    JWT, raw file bytes, or other secret in here. Stored as a native
+    embedded document (no more manual JSON serialization).
     """
     entry = models.AuditLog(
         user_id=user_id,
         action=action,
-        details=json.dumps(details, default=str) if details else None,
+        details=details,
         incident_id=incident_id,
         evidence_id=evidence_id,
         ip_address=ip_address,
     )
-    db.add(entry)
+    await entry.insert(session=session)
     return entry

@@ -18,11 +18,10 @@ import uuid
 from datetime import datetime, timezone
 from typing import Dict, Optional, Set
 
-from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from jose import JWTError
-from sqlalchemy.orm import Session
 
-from .. import database, models
+from .. import models
 from ..auth.security import decode_access_token
 from .settings import load_settings
 
@@ -116,7 +115,7 @@ def build_event(event: str, data: dict) -> dict:
     }
 
 
-async def _authenticate_websocket(token: Optional[str], db: Session) -> Optional[models.User]:
+async def _authenticate_websocket(token: Optional[str]) -> Optional[models.User]:
     """
     Returns the authenticated, active User for a valid token, or None for
     ANY failure (missing token, malformed/invalid/expired JWT, unknown
@@ -133,7 +132,7 @@ async def _authenticate_websocket(token: Optional[str], db: Session) -> Optional
         user_id = uuid.UUID(payload.sub) if isinstance(payload.sub, str) else payload.sub
     except (ValueError, AttributeError, TypeError):
         return None
-    user = db.query(models.User).filter(models.User.id == user_id).first()
+    user = await models.User.get(user_id)
     if not user or user.status != models.UserStatus.active:
         return None
     return user
@@ -143,7 +142,6 @@ async def _authenticate_websocket(token: Optional[str], db: Session) -> Optional
 async def websocket_endpoint(
     websocket: WebSocket,
     token: Optional[str] = Query(default=None),
-    db: Session = Depends(database.get_db),
 ):
     """
     Single WebSocket gateway for all authenticated operational roles
@@ -162,7 +160,7 @@ async def websocket_endpoint(
     on any auth failure this closes the socket immediately without
     calling websocket.accept() first.
     """
-    user = await _authenticate_websocket(token, db)
+    user = await _authenticate_websocket(token)
     if not user:
         await websocket.close(code=4401)
         return
@@ -193,7 +191,7 @@ async def websocket_endpoint(
         await websocket.accept()
         manager.add_station(station_id, websocket)
     elif role == models.UserRole.constable:
-        constable = db.query(models.Constable).filter(models.Constable.user_id == user.id).first()
+        constable = await models.Constable.find_one(models.Constable.user_id == user.id)
         if not constable:
             await websocket.close(code=4404)
             return
