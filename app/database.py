@@ -10,7 +10,21 @@ MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "police_db")
 # pymongo refuses to encode/decode plain `uuid.UUID` values at all (every
 # id/foreign-key field in app/models.py is a UUID), raising
 # ConfigurationError the first time any query touches one.
-client = AsyncIOMotorClient(MONGODB_URL, uuidRepresentation="standard")
+#
+# tz_aware=True is required too (not optional): BSON datetimes carry no
+# timezone of their own (they're implicitly UTC), and every _utcnow()
+# helper across the codebase already writes a tz-AWARE UTC datetime --
+# but without this flag, Motor silently strips that tzinfo back off on
+# every READ, handing routers/schemas a naive datetime that LOOKS like
+# UTC but no longer says so. FastAPI/Pydantic then serializes it with no
+# 'Z'/offset suffix at all (e.g. "2026-10-02T09:54:25.371000"), which a
+# browser's `new Date(...)` misinterprets as ITS OWN local time rather
+# than UTC -- corrupting every timestamp the web dashboard and mobile app
+# display (confirmed directly against the live API: recordings' started_at
+# round-tripped through Mongo came back exactly this way). With
+# tz_aware=True, reads come back tz-aware UTC too, matching every
+# _utcnow() write site, and serialize with a real UTC offset.
+client = AsyncIOMotorClient(MONGODB_URL, uuidRepresentation="standard", tz_aware=True)
 database = client[MONGODB_DB_NAME]
 
 
