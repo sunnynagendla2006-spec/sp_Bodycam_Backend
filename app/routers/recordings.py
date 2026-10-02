@@ -15,6 +15,8 @@ import datetime
 import hashlib
 import logging
 import os
+import shutil
+import tempfile
 import uuid
 from typing import Optional
 
@@ -422,14 +424,22 @@ async def _try_build_playable_recording(session: models.RecordingSession) -> Non
     """
     Best-effort: concatenates this recording's chunks (in chunk_number
     order) into one playable file via ffmpeg's concat demuxer with stream
-    copy. Never raises. Only runs against the LocalFilesystemStorage
-    backend.
+    copy. Never raises.
+
+    Runs against LocalFilesystemStorage (chunks referenced by their
+    on-disk path directly -- unchanged from before S3 support) and
+    S3StorageBackend (ffmpeg needs real local file paths, so chunks are
+    first downloaded to a scratch temp dir; the resulting file is then
+    uploaded back to the same bucket via the storage abstraction, so this
+    works for production deployments whose disk isn't persistent/shared
+    across restarts).
     """
     storage = media_module._get_storage_backend()
-    if not isinstance(storage, storage_service.LocalFilesystemStorage):
+    is_local = isinstance(storage, storage_service.LocalFilesystemStorage)
+    if not is_local and not isinstance(storage, storage_service.S3StorageBackend):
         session.playable_status = "failed"
         await session.save()
-        logger.warning(f"recording {session.id}: playable build skipped -- not on LocalFilesystemStorage")
+        logger.warning(f"recording {session.id}: playable build skipped -- unsupported storage backend")
         return
 
     chunks = sorted(session.chunks, key=lambda c: c.chunk_number)
@@ -442,43 +452,63 @@ async def _try_build_playable_recording(session: models.RecordingSession) -> Non
     await session.save()
 
     playable_key = f"recordings/{session.id}/playable.mp4"
-    playable_abs_path = storage._abs_path(playable_key)
-    concat_list_path = storage._abs_path(f"recordings/{session.id}/_concat_list.txt")
-    os.makedirs(os.path.dirname(playable_abs_path), exist_ok=True)
 
-    with open(concat_list_path, "w") as f:
-        for chunk in chunks:
-            abs_chunk_path = storage._abs_path(chunk.storage_key)
-            escaped = abs_chunk_path.replace("'", "'\\''")
-            f.write(f"file '{escaped}'\n")
+    with tempfile.TemporaryDirectory(prefix=f"recording_{session.id}_") as tmp_dir:
+        if is_local:
+            chunk_paths = [storage._abs_path(c.storage_key) for c in chunks]
+            output_path = storage._abs_path(playable_key)
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        else:
+            try:
+                chunk_paths = []
+                for chunk in chunks:
+                    size = storage.get_size(chunk.storage_key)
+                    if not size:
+                        raise RuntimeError(f"chunk {chunk.chunk_number} missing/empty in storage")
+                    local_path = os.path.join(tmp_dir, f"chunk_{chunk.chunk_number:06d}.mp4")
+                    with open(local_path, "wb") as f:
+                        for data in storage.read_range(chunk.storage_key, 0, size - 1):
+                            f.write(data)
+                    chunk_paths.append(local_path)
+            except Exception as exc:
+                session.playable_status = "failed"
+                await session.save()
+                logger.warning(f"recording {session.id}: failed to stage chunks from storage for concat: {exc}")
+                return
+            output_path = os.path.join(tmp_dir, "playable.mp4")
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path, "-c", "copy", playable_abs_path,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        returncode = proc.returncode
-    except FileNotFoundError:
-        returncode = -1
-        stderr = b"ffmpeg is not installed in this environment"
-    finally:
+        concat_list_path = os.path.join(tmp_dir, "_concat_list.txt")
+        with open(concat_list_path, "w") as f:
+            for p in chunk_paths:
+                escaped = p.replace("'", "'\\''")
+                f.write(f"file '{escaped}'\n")
+
         try:
-            os.remove(concat_list_path)
-        except OSError:
-            pass
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path, "-c", "copy", output_path,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            returncode = proc.returncode
+        except FileNotFoundError:
+            returncode = -1
+            stderr = b"ffmpeg is not installed in this environment"
 
-    if returncode == 0 and os.path.exists(playable_abs_path) and os.path.getsize(playable_abs_path) > 0:
-        session.playable_status = "ready"
-        session.playable_storage_key = playable_key
-    else:
-        session.playable_status = "failed"
-        logger.warning(f"recording {session.id}: ffmpeg concat failed (code={returncode}): {stderr.decode(errors='replace')[-2000:]}")
-        try:
-            if os.path.exists(playable_abs_path):
-                os.remove(playable_abs_path)
-        except OSError:
-            pass
+        if returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            if not is_local:
+                with open(output_path, "rb") as src, storage.open_write(playable_key) as dst:
+                    shutil.copyfileobj(src, dst)
+            session.playable_status = "ready"
+            session.playable_storage_key = playable_key
+        else:
+            session.playable_status = "failed"
+            logger.warning(f"recording {session.id}: ffmpeg concat failed (code={returncode}): {stderr.decode(errors='replace')[-2000:]}")
+            if is_local:
+                try:
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+                except OSError:
+                    pass
     await session.save()
 
 
