@@ -141,6 +141,17 @@ class RemoteCommandType(str, enum.Enum):
     stop_recording = "stop_recording"
     start_live_stream = "start_live_stream"
     stop_live_stream = "stop_live_stream"
+    # Sets which camera the device uses for its NEXT recording -- never
+    # rebinds the camera mid-recording (the app's own local volume-button
+    # trigger already never does that either, see
+    # mobile_app/lib/utils/volume_trigger_logic.dart's doc comment: any
+    # trigger while already recording only ever stops it, to avoid
+    # corrupting the upload pipeline or creating a duplicate session). If
+    # a recording IS active when this arrives, the device stops it (same
+    # as the existing local behavior) rather than silently ignoring the
+    # command or rebinding hardware mid-capture.
+    switch_camera_front = "switch_camera_front"
+    switch_camera_back = "switch_camera_back"
 
 
 class RemoteCommandStatus(str, enum.Enum):
