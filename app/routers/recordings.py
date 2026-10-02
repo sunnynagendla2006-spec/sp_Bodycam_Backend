@@ -90,73 +90,88 @@ async def _burn_watermark_best_effort(
     and never corrupts/loses the chunk: on ANY failure the ORIGINAL file at
     storage_key is left completely untouched. Returns (new_size,
     new_sha256_hex) on success, None on skip/failure.
-    """
-    if not isinstance(storage, storage_service.LocalFilesystemStorage):
-        logger.warning(f"chunk {storage_key}: watermark burn skipped -- not on LocalFilesystemStorage")
-        return None
 
-    original_abs_path = storage._abs_path(storage_key)
-    burned_abs_path = original_abs_path + ".watermarked.tmp.mp4"
-    info_text_path = original_abs_path + ".overlay.txt"
+    Works against LocalFilesystemStorage (re-encoded in place, as before)
+    and S3StorageBackend (the original is downloaded to a scratch temp
+    file since ffmpeg needs a real local path, burned there, then uploaded
+    back to the same storage_key -- only once ffmpeg has already
+    succeeded, so a mid-upload failure still can't touch the original
+    object in the bucket).
+    """
+    is_local = isinstance(storage, storage_service.LocalFilesystemStorage)
+    if not is_local and not isinstance(storage, storage_service.S3StorageBackend):
+        logger.warning(f"chunk {storage_key}: watermark burn skipped -- unsupported storage backend")
+        return None
 
     status_text, info_text = _format_watermark_text(session, latitude, longitude, recorded_at)
 
-    returncode = -1
-    stderr = b""
-    try:
-        with open(info_text_path, "w") as f:
-            f.write(info_text)
+    with tempfile.TemporaryDirectory(prefix="watermark_") as tmp_dir:
+        if is_local:
+            original_abs_path = storage._abs_path(storage_key)
+        else:
+            size = storage.get_size(storage_key)
+            if not size:
+                logger.warning(f"chunk {storage_key}: watermark burn skipped -- object missing/empty in storage")
+                return None
+            original_abs_path = os.path.join(tmp_dir, "original.mp4")
+            with open(original_abs_path, "wb") as f:
+                for data in storage.read_range(storage_key, 0, size - 1):
+                    f.write(data)
 
-        vf = (
-            "drawbox=x=10:y=10:w=22:h=22:color=red@0.9:t=fill,"
-            f"drawtext=text='{_escape_drawtext(status_text)}':fontfile={_WATERMARK_FONT_PATH}:"
-            "fontcolor=white:fontsize=22:x=42:y=12:box=1:boxcolor=black@0.45:boxborderw=6,"
-            f"drawtext=textfile={info_text_path}:fontfile={_WATERMARK_FONT_PATH}:"
-            "fontcolor=white:fontsize=18:x=10:y=h-th-14:line_spacing=6:box=1:boxcolor=black@0.5:boxborderw=8"
-        )
+        burned_abs_path = os.path.join(tmp_dir, "watermarked.mp4")
+        info_text_path = os.path.join(tmp_dir, "overlay.txt")
 
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-i", original_abs_path,
-            "-vf", vf,
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-            "-c:a", "copy",
-            "-movflags", "+faststart",
-            burned_abs_path,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        returncode = proc.returncode
-    except FileNotFoundError:
-        stderr = b"ffmpeg is not installed in this environment"
-    except Exception as exc:  # never let a watermark failure break chunk upload
-        stderr = str(exc).encode()
-    finally:
+        returncode = -1
+        stderr = b""
         try:
-            os.remove(info_text_path)
-        except OSError:
-            pass
+            with open(info_text_path, "w") as f:
+                f.write(info_text)
 
-    if returncode != 0 or not os.path.exists(burned_abs_path) or os.path.getsize(burned_abs_path) == 0:
-        logger.warning(f"chunk {storage_key}: watermark burn failed (code={returncode}): {stderr.decode(errors='replace')[-2000:]}")
-        try:
-            if os.path.exists(burned_abs_path):
-                os.remove(burned_abs_path)
-        except OSError:
-            pass
-        return None
+            vf = (
+                "drawbox=x=10:y=10:w=22:h=22:color=red@0.9:t=fill,"
+                f"drawtext=text='{_escape_drawtext(status_text)}':fontfile={_WATERMARK_FONT_PATH}:"
+                "fontcolor=white:fontsize=22:x=42:y=12:box=1:boxcolor=black@0.45:boxborderw=6,"
+                f"drawtext=textfile={info_text_path}:fontfile={_WATERMARK_FONT_PATH}:"
+                "fontcolor=white:fontsize=18:x=10:y=h-th-14:line_spacing=6:box=1:boxcolor=black@0.5:boxborderw=8"
+            )
 
-    hasher = hashlib.sha256()
-    with open(burned_abs_path, "rb") as f:
-        while True:
-            piece = f.read(media_module._READ_CHUNK_SIZE)
-            if not piece:
-                break
-            hasher.update(piece)
-    new_size = os.path.getsize(burned_abs_path)
-    new_hash = hasher.hexdigest()
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-i", original_abs_path,
+                "-vf", vf,
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-c:a", "copy",
+                "-movflags", "+faststart",
+                burned_abs_path,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            returncode = proc.returncode
+        except FileNotFoundError:
+            stderr = b"ffmpeg is not installed in this environment"
+        except Exception as exc:  # never let a watermark failure break chunk upload
+            stderr = str(exc).encode()
 
-    os.replace(burned_abs_path, original_abs_path)  # same filesystem -- atomic
-    return new_size, new_hash
+        if returncode != 0 or not os.path.exists(burned_abs_path) or os.path.getsize(burned_abs_path) == 0:
+            logger.warning(f"chunk {storage_key}: watermark burn failed (code={returncode}): {stderr.decode(errors='replace')[-2000:]}")
+            return None
+
+        hasher = hashlib.sha256()
+        with open(burned_abs_path, "rb") as f:
+            while True:
+                piece = f.read(media_module._READ_CHUNK_SIZE)
+                if not piece:
+                    break
+                hasher.update(piece)
+        new_size = os.path.getsize(burned_abs_path)
+        new_hash = hasher.hexdigest()
+
+        if is_local:
+            os.replace(burned_abs_path, original_abs_path)  # same filesystem -- atomic
+        else:
+            with open(burned_abs_path, "rb") as src, storage.open_write(storage_key) as dst:
+                shutil.copyfileobj(src, dst)
+
+        return new_size, new_hash
 
 
 def _to_recording_response(session: models.RecordingSession) -> schemas.RecordingSessionResponse:

@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from .. import geo, models, schemas
 from ..auth.deps import get_current_user, require_role
+from ..auth.security import hash_password
 from ..services.audit import log_action
 from ..services import events
 
@@ -438,13 +439,26 @@ async def update_location(
 class ConstableCreate(BaseModel):
     phone: str
     badge_number: str
+    # REQUIRED -- previously absent here entirely, which created a User
+    # with hashed_password left at its default None. /auth/login's
+    # verify_password(creds.password, user.hashed_password or "") then has
+    # no real hash to check against, so that constable could never log
+    # into the mobile app at all. The admin sets this when creating the
+    # account (same phone+password contract every other login already
+    # uses -- see seed_demo.py/seed_test_data.py for the same pattern).
+    password: str
 
 @router.post("/")
 async def create_constable(
     req: ConstableCreate,
     current_user: models.User = Depends(require_role("admin")),
 ):
-    new_user = models.User(phone=req.phone, role=models.UserRole.constable)
+    if len(req.password) < 8:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Password must be at least 8 characters")
+    existing = await models.User.find_one(models.User.phone == req.phone)
+    if existing:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A user with this phone number already exists")
+    new_user = models.User(phone=req.phone, role=models.UserRole.constable, hashed_password=hash_password(req.password))
     await new_user.insert()
     new_constable = models.Constable(user_id=new_user.id, badge_number=req.badge_number, status=models.ConstableStatus.available, battery_level=100)
     await new_constable.insert()
