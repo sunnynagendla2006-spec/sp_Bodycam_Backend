@@ -434,6 +434,50 @@ async def test_repeated_observation_of_offline_device_does_not_duplicate_alert(f
     assert len(alerts) == 1
 
 
+async def test_device_offline_ends_its_stale_live_stream_session(full_client, make_user, make_constable, auth_header):
+    """
+    A live-view session active when the device drops offline must not be
+    left showing "live" forever -- nothing will ever call the normal
+    POST /live-stream/{id}/stop for it once the device itself is gone, so
+    observing the device as offline must end it the same way (confirmed
+    this was the real cause of a camera's dashboard card showing "Live"
+    alongside "Offline" simultaneously, with "Watch live" hanging on
+    "Connecting…" forever).
+    """
+    import uuid as uuid_module
+    from app import models
+
+    await make_user(phone="c000000030admin", password="pw", role=UserRole.admin)
+    _, constable = await make_constable(phone="c000000030c")
+    c_headers = await auth_header("c000000030c", "correct-horse-battery")
+    device_id = await _register_device(full_client, c_headers, "phone-c030")
+
+    device = await models.Device.get(uuid_module.UUID(device_id))
+    device.last_seen_at = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=900)
+    await device.save()
+
+    live_session = models.LiveStreamSession(
+        device_id=uuid_module.UUID(device_id),
+        constable_id=constable.id,
+        room_name="test-room-030",
+        status=models.LiveStreamStatus.live,
+        started_by=models.LiveStreamStartedBy.self,
+    )
+    await live_session.insert()
+
+    admin_headers = await auth_header("c000000030admin", "pw")
+    resp = await full_client.get(f"/devices/{device_id}", headers=admin_headers)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "offline"
+
+    ended = await models.LiveStreamSession.get(live_session.id)
+    assert ended.status == models.LiveStreamStatus.ended
+    assert ended.ended_at is not None
+
+    logs = await _get_logs("live_stream.ended")
+    assert any(l.details.get("session_id") == str(live_session.id) and l.details.get("reason") == "device_offline" for l in logs)
+
+
 async def test_recovery_via_heartbeat_resolves_offline_alert(full_client, make_user, make_constable, auth_header):
     import uuid as uuid_module
     from app import models

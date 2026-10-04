@@ -26,7 +26,8 @@ from ..services.audit import log_action
 from ..services import events
 from ..services import alerts as alerts_service
 from .constables import get_own_constable
-from .devices import _device_station_id
+from .devices import _device_station_id, compute_effective_status
+from .settings import load_settings
 
 router = APIRouter(tags=["Remote Commands"])
 
@@ -97,6 +98,23 @@ async def create_command(
 ):
     device = await _get_device_or_404(device_id)
     await _authorize_command_issue(device, current_user)
+
+    # Unlike start_recording/stop_recording/switch_camera_* (which are
+    # legitimately fine to queue -- the device picks them up the moment it
+    # reconnects, even hours later, see command_listener_service.dart's
+    # missed-command recovery), a live view is inherently a "right now"
+    # request: an offline device can't act on it at all while offline, and
+    # confirmed directly that letting this through left Control Room
+    # stuck on "Connecting…" forever with zero feedback once the command
+    # WAS eventually delivered, since by then there's usually no one left
+    # watching. Rejected outright here rather than silently queued.
+    if payload.command_type == models.RemoteCommandType.start_live_stream:
+        effective_status = compute_effective_status(device, load_settings())
+        if effective_status == models.DeviceStatus.offline:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This camera is offline and cannot start a live view right now.",
+            )
 
     now = _utcnow()
     command = models.RemoteCommand(

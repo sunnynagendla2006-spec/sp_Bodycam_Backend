@@ -13,6 +13,7 @@ import uuid
 from typing import Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from .. import models, schemas
@@ -423,6 +424,35 @@ async def _observe_and_alert_device_status(device: models.Device, settings: dict
                     details={"alert_type": "recording_device_offline", "device_id": str(device.id), "recording_session_id": str(active_recording.id), "last_seen_at": device.last_seen_at.isoformat() if device.last_seen_at else None},
                 )
                 await events.publish_generic_alert_event(rec_alert, current_station_id, "recording.device_offline")
+
+        # A "live view" session active when the device drops offline would
+        # otherwise stay "live" in Control Room forever: the device itself
+        # is gone, so nothing will ever call the normal
+        # POST /live-stream/{id}/stop path for it (see
+        # live_stream.py::stop_live_stream) -- confirmed directly causing
+        # a camera's dashboard card to show "Live" alongside "Offline"
+        # simultaneously, with "Watch live" just hanging on "Connecting…"
+        # forever since nothing is actually publishing. Ended here the
+        # same way (live -> ended, same CAS pattern), the moment anyone
+        # observes this device as offline.
+        live_session = await models.LiveStreamSession.find_one(
+            models.LiveStreamSession.device_id == device.id,
+            models.LiveStreamSession.status == models.LiveStreamStatus.live,
+        )
+        if live_session:
+            now = _utcnow()
+            before = await models.LiveStreamSession.get_motor_collection().find_one_and_update(
+                {"_id": live_session.id, "status": models.LiveStreamStatus.live.value},
+                {"$set": {"status": models.LiveStreamStatus.ended.value, "ended_at": now}},
+                return_document=ReturnDocument.BEFORE,
+            )
+            if before is not None:
+                await log_action(
+                    user_id=None, action="live_stream.ended",
+                    details={"session_id": str(live_session.id), "device_id": str(device.id), "reason": "device_offline"},
+                )
+                ended_session = await models.LiveStreamSession.get(live_session.id)
+                await events.publish_live_stream_ended(ended_session, current_station_id)
         return
 
 
