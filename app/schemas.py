@@ -2,7 +2,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from typing import Optional, List
 import uuid
 from datetime import datetime
-from .models import UserRole, UserStatus, ConstableStatus, IncidentStatus, MediaType, UploadStatus, AssignmentStatus, DeviceStatus, AlertType, AlertSeverity, AlertStatus, RecordingTriggerType, RecordingStatus, RemoteCommandType, RemoteCommandStatus, LiveStreamStatus, LiveStreamStartedBy
+from .models import UserRole, UserStatus, ConstableStatus, IncidentStatus, MediaType, UploadStatus, AssignmentStatus, DeviceStatus, AlertType, AlertSeverity, AlertStatus, RecordingTriggerType, RecordingStatus, RemoteCommandType, RemoteCommandStatus, LiveStreamStatus, LiveStreamStartedBy, CCTVProviderType, CCTVStreamProtocol, CCTVCameraStatus, CCTVStreamSessionStatus, CCTVCapabilities, AccessPointStatus, PresenceConnectionStatus, PresenceEventSource, DeploymentStatus
 
 class UserBase(BaseModel):
     phone: str
@@ -526,3 +526,378 @@ class LiveStreamTokenResponse(BaseModel):
     token: str
     identity: str
     can_publish: bool
+
+
+# ---------------------------------------------------------------------------
+# Authorized CCTV monitoring (admin + control_room only -- see
+# app/routers/cctv.py). See app/models.py::CCTVCamera for why this is a
+# separate domain from Device/RecordingSession.
+# ---------------------------------------------------------------------------
+
+class CCTVCameraCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    camera_code: str = Field(..., min_length=1, max_length=64)
+    description: Optional[str] = None
+    # Informational only -- see models.CCTVCamera's docstring; never
+    # selects a different code path than provider_type does.
+    manufacturer: Optional[str] = Field(default=None, max_length=100)
+    model: Optional[str] = Field(default=None, max_length=100)
+    station_id: Optional[uuid.UUID] = None
+    zone: Optional[str] = None
+    address: Optional[str] = None
+    latitude: float = Field(..., ge=-90.0, le=90.0)
+    longitude: float = Field(..., ge=-180.0, le=180.0)
+
+    provider_type: CCTVProviderType = CCTVProviderType.rtsp
+    stream_protocol: CCTVStreamProtocol = CCTVStreamProtocol.rtsp
+    # Plain connection-target fields, never a single credentialed URL --
+    # see models.CCTVCamera's docstring. stream_host accepts a hostname or
+    # bare IP; it is NOT a URL and must not contain a scheme or userinfo.
+    stream_host: str = Field(..., min_length=1)
+    stream_port: int = Field(default=554, ge=1, le=65535)
+    stream_path: Optional[str] = None
+    management_url: Optional[str] = None
+
+    username: Optional[str] = None
+    # Plaintext ONLY as API input, for exactly as long as it takes to
+    # encrypt it (see services/cctv_security.py::encrypt_secret). Never
+    # stored, logged, or echoed back as plaintext anywhere.
+    secret: Optional[str] = None
+
+    is_demo: bool = False
+    metadata: Optional[dict] = None
+
+
+class CCTVCameraUpdateRequest(BaseModel):
+    """All fields optional -- only the ones provided are changed. camera_code is intentionally not updatable here (stable natural key, same convention as Device.device_identifier)."""
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    description: Optional[str] = None
+    manufacturer: Optional[str] = Field(default=None, max_length=100)
+    model: Optional[str] = Field(default=None, max_length=100)
+    station_id: Optional[uuid.UUID] = None
+    zone: Optional[str] = None
+    address: Optional[str] = None
+    latitude: Optional[float] = Field(default=None, ge=-90.0, le=90.0)
+    longitude: Optional[float] = Field(default=None, ge=-180.0, le=180.0)
+
+    provider_type: Optional[CCTVProviderType] = None
+    stream_protocol: Optional[CCTVStreamProtocol] = None
+    stream_host: Optional[str] = Field(default=None, min_length=1)
+    stream_port: Optional[int] = Field(default=None, ge=1, le=65535)
+    stream_path: Optional[str] = None
+    management_url: Optional[str] = None
+
+    username: Optional[str] = None
+    secret: Optional[str] = None
+    clear_secret: bool = False  # explicit -- omitting `secret` always means "leave it unchanged", never "clear it"
+
+    is_demo: Optional[bool] = None
+    metadata: Optional[dict] = None
+
+
+class CCTVCameraResponse(BaseModel):
+    """
+    Safe, API-facing camera view. NEVER includes `encrypted_secret` or any
+    derived plaintext of it -- only `credentials_configured`. See the
+    module docstring on app/routers/cctv.py.
+    """
+    id: uuid.UUID
+    name: str
+    camera_code: str
+    description: Optional[str] = None
+    manufacturer: Optional[str] = None
+    model: Optional[str] = None
+    capabilities: CCTVCapabilities
+    station_id: Optional[uuid.UUID] = None
+    zone: Optional[str] = None
+    address: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+    provider_type: CCTVProviderType
+    stream_protocol: CCTVStreamProtocol
+    stream_host: str
+    stream_port: int
+    stream_path: Optional[str] = None
+    management_url: Optional[str] = None
+
+    username: Optional[str] = None
+    credentials_configured: bool
+
+    enabled: bool
+    status: CCTVCameraStatus
+    last_seen_at: Optional[datetime] = None
+    last_status_check_at: Optional[datetime] = None
+    last_error: Optional[str] = None
+    is_demo: bool
+
+    created_at: datetime
+    updated_at: datetime
+    created_by: Optional[uuid.UUID] = None
+    updated_by: Optional[uuid.UUID] = None
+    metadata: Optional[dict] = None
+
+
+class CCTVCameraTestResponse(BaseModel):
+    camera_id: uuid.UUID
+    status: CCTVCameraStatus
+    checked_at: datetime
+    latency_ms: Optional[float] = None
+    error: Optional[str] = None
+    # Set from the REAL probe result for the camera's configured
+    # provider_type -- never inferred from manufacturer/model. Unset
+    # (None) when the probe didn't produce a capability determination
+    # (e.g. the provider raised NotImplementedError).
+    capabilities: Optional[CCTVCapabilities] = None
+
+
+class CCTVDiscoveredDeviceResponse(BaseModel):
+    """One WS-Discovery ProbeMatch -- a CANDIDATE, never an auto-registered camera. See cctv_discovery.py."""
+    address: str
+    xaddrs: List[str]
+    scopes: List[str]
+    types: List[str]
+
+
+class CCTVNearbyCameraResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    camera_code: str
+    station_id: Optional[uuid.UUID] = None
+    latitude: float
+    longitude: float
+    distance_meters: float
+    status: CCTVCameraStatus
+    enabled: bool
+
+
+class CCTVStreamSessionResponse(BaseModel):
+    """`stream_reference` is an opaque gateway-side id (e.g. a room/ingress name), never a raw or credentialed URL."""
+    id: uuid.UUID
+    camera_id: uuid.UUID
+    requested_by: uuid.UUID
+    provider: CCTVProviderType
+    protocol: CCTVStreamProtocol
+    gateway: Optional[str] = None
+    stream_reference: Optional[str] = None
+    status: CCTVStreamSessionStatus
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+    viewer_count: int
+    error: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CCTVStreamStartResponse(BaseModel):
+    """Never includes a LiveKit API secret -- only a short-lived signed viewer token, when a media gateway actually produced one (see CCTVProvider.start_stream)."""
+    session: CCTVStreamSessionResponse
+    livekit_url: Optional[str] = None
+    token: Optional[str] = None
+    identity: Optional[str] = None
+    can_publish: bool = False
+
+
+# ---------------------------------------------------------------------------
+# AP-based police presence / movement handoff. See app/models.py's module
+# docstring above AccessPoint for why this is three separate models, and
+# app/services/presence.py for the single business-logic path every
+# caller (today: only the authenticated constable-device endpoint) goes
+# through.
+# ---------------------------------------------------------------------------
+
+class AccessPointCreateRequest(BaseModel):
+    code: str = Field(..., min_length=1, max_length=32)
+    name: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = Field(default=None, max_length=1000)
+    zone: Optional[str] = None
+    deployment: Optional[str] = None
+    station_id: Optional[uuid.UUID] = None
+    latitude: Optional[float] = Field(default=None, ge=-90.0, le=90.0)
+    longitude: Optional[float] = Field(default=None, ge=-180.0, le=180.0)
+    coverage_radius_m: Optional[float] = Field(default=None, gt=0)
+    edge_node_id: Optional[str] = Field(default=None, max_length=128)
+    is_demo: bool = False
+
+
+class AccessPointUpdateRequest(BaseModel):
+    """All fields optional -- only the ones provided are changed. `code` is not updatable here (stable natural key, same convention as Device.device_identifier / CCTVCamera.camera_code)."""
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    description: Optional[str] = Field(default=None, max_length=1000)
+    zone: Optional[str] = None
+    deployment: Optional[str] = None
+    station_id: Optional[uuid.UUID] = None
+    latitude: Optional[float] = Field(default=None, ge=-90.0, le=90.0)
+    longitude: Optional[float] = Field(default=None, ge=-180.0, le=180.0)
+    coverage_radius_m: Optional[float] = Field(default=None, gt=0)
+    edge_node_id: Optional[str] = Field(default=None, max_length=128)
+    is_demo: Optional[bool] = None
+
+
+class AccessPointResponse(BaseModel):
+    id: uuid.UUID
+    code: str
+    name: str
+    description: Optional[str] = None
+    zone: Optional[str] = None
+    deployment: Optional[str] = None
+    station_id: Optional[uuid.UUID] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    coverage_radius_m: Optional[float] = None
+    edge_node_id: Optional[str] = None
+    enabled: bool
+    status: AccessPointStatus
+    is_demo: bool
+    created_at: datetime
+    updated_at: datetime
+    # Populated only by GET /access-points (list), which already has to
+    # scan current presence rows to answer "how many officers are here" --
+    # left unset (None) on single-camera-style reads that don't compute it.
+    associated_device_count: Optional[int] = None
+
+
+class PresenceAssociationRequest(BaseModel):
+    """
+    `device_identifier` (not device_id) matches the existing convention in
+    schemas.DeviceHeartbeatRequest -- the caller identifies the device by
+    its client-known identifier, never a server-side UUID it was never
+    given. `source` is deliberately NOT a field here -- see
+    models.PresenceEventSource's docstring: it is always server-set to
+    REAL for this endpoint.
+    """
+    device_identifier: str = Field(..., min_length=1)
+    access_point_code: str = Field(..., min_length=1)
+    event_id: Optional[str] = Field(default=None, max_length=128)
+    occurred_at: Optional[datetime] = None
+
+
+class PresenceHandoffResponse(BaseModel):
+    id: uuid.UUID
+    device_id: uuid.UUID
+    constable_id: uuid.UUID
+    previous_access_point_id: Optional[uuid.UUID] = None
+    access_point_id: uuid.UUID
+    event_id: Optional[str] = None
+    source: PresenceEventSource
+    occurred_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+class PresenceStateResponse(BaseModel):
+    """
+    `status` is the EFFECTIVE status (computed at request time from
+    last_seen_at + configurable thresholds -- see
+    services/presence.py::compute_effective_presence_status), exactly the
+    same pattern as schemas.DeviceResponse.status.
+    """
+    device_id: uuid.UUID
+    constable_id: uuid.UUID
+    current_access_point_id: Optional[uuid.UUID] = None
+    current_access_point_code: Optional[str] = None
+    current_zone: Optional[str] = None
+    status: PresenceConnectionStatus
+    location_source: str
+    last_seen_at: Optional[datetime] = None
+    handoff_count: int
+    current_zone_since: Optional[datetime] = None
+    updated_at: datetime
+
+
+class PresenceAssociationResponse(BaseModel):
+    status: str  # "connected" | "handoff" | "duplicate_ignored"
+    handoff_created: bool
+    presence: PresenceStateResponse
+    handoff: Optional[PresenceHandoffResponse] = None
+
+
+# ---------------------------------------------------------------------------
+# Virtual AP / zone / deployment layer -- see app/models.py::Deployment's
+# docstring for why zones are a derived view, not a stored entity, and
+# app/services/ap_association.py for the provider abstraction these
+# schemas front.
+# ---------------------------------------------------------------------------
+
+class DeploymentCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=64)
+    description: Optional[str] = None
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    is_demo: bool = False
+
+
+class DeploymentUpdateRequest(BaseModel):
+    description: Optional[str] = None
+    status: Optional[DeploymentStatus] = None
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+
+
+class DeploymentResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    description: Optional[str] = None
+    status: DeploymentStatus
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    is_demo: bool
+    created_at: datetime
+    updated_at: datetime
+    zone_count: Optional[int] = None
+    access_point_count: Optional[int] = None
+
+
+class ZoneSummaryResponse(BaseModel):
+    """A zone is a derived grouping of AccessPoint.zone within one deployment -- never a stored row. See Deployment's docstring."""
+    zone: str
+    deployment: Optional[str] = None
+    access_point_codes: List[str]
+    enabled: bool  # true iff at least one AP in this zone is enabled
+    police_count: int
+    moving_count: int
+
+
+class PresenceAssociationVirtualRequest(BaseModel):
+    """
+    Identical shape to PresenceAssociationRequest -- kept as a distinct
+    schema (not reused) so the virtual-only endpoint's OpenAPI docs are
+    self-explanatory and so a future field divergence doesn't require
+    touching the real-association contract. `source` is still never
+    client-settable here either -- see routers/presence.py::associate_virtual.
+    """
+    device_identifier: str = Field(..., min_length=1)
+    access_point_code: str = Field(..., min_length=1)
+    event_id: Optional[str] = Field(default=None, max_length=128)
+
+
+class PresenceMovingPingRequest(BaseModel):
+    """
+    Pure WebSocket passthrough -- see routers/presence.py::moving_ping.
+    NEVER persisted to MongoDB (no model, no collection): this is exactly
+    the "don't store every animation frame" requirement. `progress` is
+    the simulator's own client-side animation progress, 0-100, purely
+    informational for the admin's live view.
+    """
+    device_identifier: str = Field(..., min_length=1)
+    target_access_point_code: str = Field(..., min_length=1)
+    progress: int = Field(..., ge=0, le=100)
+
+
+class NearestAccessPointResponse(BaseModel):
+    id: uuid.UUID
+    code: str
+    name: str
+    zone: Optional[str] = None
+    distance_meters: float
+
+
+class ZoneAlertRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=500)
+
+
+class ZoneAlertResponse(BaseModel):
+    zone: str
+    message: str
+    targeted_constable_ids: List[uuid.UUID]
+    targeted_device_count: int

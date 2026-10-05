@@ -33,11 +33,21 @@ a separate thread/loop per request, which would break Beanie the moment
 any route or fixture touched the database. WebSocket tests connect via
 `httpx_ws.aconnect_ws(url, client)` instead of `client.websocket_connect`.
 """
+import contextlib
 import os
 import uuid
 
+from cryptography.fernet import Fernet
+
 os.environ.setdefault("JWT_SECRET_KEY", "test-only-secret-key")
 os.environ.setdefault("ACCESS_TOKEN_EXPIRE_MINUTES", "60")
+# CCTV: a fixed key (rather than the real per-process random dev fallback)
+# so encrypt/decrypt round-trips are stable across however this module
+# gets imported/reloaded during a test run. 127.0.0.1/::1 are allow-listed
+# so tests can point a fake camera at a local TCP server they spin up
+# themselves -- see tests/test_cctv_providers.py.
+os.environ.setdefault("CCTV_SECRET_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("CCTV_ALLOWED_NETWORKS", "127.0.0.1/32,::1/128")
 
 import pytest
 import pytest_asyncio
@@ -68,18 +78,67 @@ requires_mongo = pytest.mark.skipif(
 )
 
 
+@contextlib.asynccontextmanager
+async def _asgi_client(transport):
+    """
+    Wraps `AsyncClient(transport=...)` exactly like `async with AsyncClient(...) as c:`
+    would, EXCEPT it swallows one specific, confirmed-upstream exception
+    on exit: `httpx_ws`'s `ASGIWebSocketTransport.__aexit__` (as of
+    httpx-ws==0.9.0, the latest release) can raise
+    `RuntimeError: Attempted to exit cancel scope in a different task
+    than it was entered in` during its own anyio cancel-scope cleanup --
+    this reproduces for EVERY test using this transport (not just ones
+    that open a real WebSocket), confirmed by bisecting anyio 4.4.0
+    through 4.15.1 (today's latest) with no version avoiding it, and by
+    running isolated single-file test runs that show the actual test
+    body's assertions pass every time; only this specific teardown call
+    errors afterward. Swallowing it here is narrowly scoped (this exact
+    RuntimeError message, nothing else) so a genuine teardown problem
+    elsewhere still surfaces normally. Remove this the day an httpx-ws
+    (or anyio) release actually fixes the underlying bug.
+    """
+    client = AsyncClient(transport=transport, base_url="http://test")
+    await client.__aenter__()
+    try:
+        yield client
+    finally:
+        try:
+            await client.__aexit__(None, None, None)
+        except RuntimeError as exc:
+            if "cancel scope" not in str(exc):
+                raise
+
+
 @pytest_asyncio.fixture()
-async def mongo_db():
-    """Beanie freshly registered against a uniquely-named, disposable test database."""
+async def mongo_db(monkeypatch):
+    """Beanie freshly registered against a uniquely-named, disposable test database.
+
+    Also repoints `app.database.client`/`app.database.database` (the
+    module-level globals `database.transaction()` uses for
+    `client.start_session()`) at this same per-test client. Without this,
+    `transaction()` opens a session on the ORIGINAL module-level client
+    (created at import time against the default/production MONGODB_URL)
+    while Beanie's Document models are bound to THIS fixture's separate
+    client/database -- passing a session from one MongoClient instance
+    into an operation on a different instance's collection raises
+    `pymongo.errors.InvalidOperation: Can only use session with the
+    MongoClient that started it`. Confirmed live: every test touching an
+    audit-logged transactional write path (dispatch, evidence
+    verification) failed with exactly that error until this was added.
+    """
     if not _MONGO_AVAILABLE:
         pytest.skip(f"No reachable MongoDB replica set at {TEST_MONGODB_URL}")
 
     from beanie import init_beanie
     from motor.motor_asyncio import AsyncIOMotorClient
 
+    from app import database as database_module
+
     db_name = f"sp_test_{uuid.uuid4().hex[:16]}"
     motor_client = AsyncIOMotorClient(TEST_MONGODB_URL, uuidRepresentation="standard")
     database = motor_client[db_name]
+    monkeypatch.setattr(database_module, "client", motor_client)
+    monkeypatch.setattr(database_module, "database", database)
     await init_beanie(database=database, document_models=models.DOCUMENT_MODELS)
     try:
         yield database
@@ -110,7 +169,7 @@ async def client(mongo_db):
         return {"ok": True}
 
     transport = ASGIWebSocketTransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    async with _asgi_client(transport) as c:
         yield c
 
 
@@ -125,16 +184,20 @@ async def full_client(mongo_db):
 
     from fastapi import FastAPI
 
+    from app.routers import access_points as access_points_router_module
     from app.routers import alerts as alerts_router_module
     from app.routers import audit_logs as audit_logs_router_module
     from app.routers import auth as auth_router_module
+    from app.routers import cctv as cctv_router_module
     from app.routers import commands as commands_router_module
     from app.routers import constables as constables_router_module
+    from app.routers import deployments as deployments_router_module
     from app.routers import devices as devices_router_module
     from app.routers import incidents as incidents_router_module
     from app.routers import live_stream as live_stream_router_module
     from app.routers import media as media_router_module
     from app.routers import police_stations as police_stations_router_module
+    from app.routers import presence as presence_router_module
     from app.routers import recordings as recordings_router_module
     from app.routers import settings as settings_router_module
     from app.routers import websocket as websocket_router_module
@@ -156,9 +219,13 @@ async def full_client(mongo_db):
     app.include_router(alerts_router_module.router)
     app.include_router(websocket_router_module.router)
     app.include_router(live_stream_router_module.router)
+    app.include_router(cctv_router_module.router)
+    app.include_router(access_points_router_module.router)
+    app.include_router(presence_router_module.router)
+    app.include_router(deployments_router_module.router)
 
     transport = ASGIWebSocketTransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    async with _asgi_client(transport) as c:
         yield c
 
 
@@ -196,6 +263,68 @@ async def make_station(mongo_db):
         return station
 
     return _make_station
+
+
+@pytest_asyncio.fixture()
+async def make_access_point(mongo_db):
+    """Factory fixture: creates an AccessPoint document (AP-based presence feature)."""
+
+    async def _make_access_point(
+        code: str = "AP-TEST-01",
+        name: str = "Test Gate",
+        zone: str = "TEST_ZONE",
+        deployment: str = "TEST DEPLOYMENT",
+        enabled: bool = True,
+        station_id=None,
+    ):
+        ap = models.AccessPoint(
+            code=code, name=name, zone=zone, deployment=deployment,
+            enabled=enabled, status=models.AccessPointStatus.online if enabled else models.AccessPointStatus.offline,
+            station_id=station_id, is_demo=True,
+        )
+        await ap.insert()
+        return ap
+
+    return _make_access_point
+
+
+@pytest_asyncio.fixture()
+async def make_deployment(mongo_db):
+    """Factory fixture: creates a Deployment document (event/operation metadata)."""
+
+    async def _make_deployment(name: str = "TEST-DEPLOYMENT-01", status_=None, is_demo: bool = True):
+        deployment = models.Deployment(
+            name=name, status=status_ or models.DeploymentStatus.active, is_demo=is_demo,
+        )
+        await deployment.insert()
+        return deployment
+
+    return _make_deployment
+
+
+@pytest_asyncio.fixture()
+async def make_cctv_camera(mongo_db):
+    """Factory fixture: creates a CCTVCamera document pointed at a given host:port (e.g. a local fake TCP server the test itself started)."""
+
+    async def _make_cctv_camera(
+        camera_code: str = "CAM-TEST-01",
+        name: str = "Test Camera",
+        stream_host: str = "127.0.0.1",
+        stream_port: int = 5540,
+        enabled: bool = True,
+        is_demo: bool = True,
+        longitude: float = 78.90,
+        latitude: float = 20.50,
+    ):
+        camera = models.CCTVCamera(
+            name=name, camera_code=camera_code, stream_host=stream_host, stream_port=stream_port,
+            location=models.GeoPoint(coordinates=[longitude, latitude]),
+            enabled=enabled, is_demo=is_demo,
+        )
+        await camera.insert()
+        return camera
+
+    return _make_cctv_camera
 
 
 @pytest_asyncio.fixture()

@@ -28,6 +28,7 @@ async def find_nearest_stations(longitude: float, latitude: float, limit: int = 
                 "near": {"type": "Point", "coordinates": [longitude, latitude]},
                 "distanceField": "distance_meters",
                 "spherical": True,
+                "key": "location",
                 "query": {"location": {"$ne": None}},
             }
         },
