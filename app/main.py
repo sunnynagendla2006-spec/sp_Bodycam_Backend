@@ -53,7 +53,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from .routers import auth, incidents, constables, media, settings, websocket, police_stations, audit_logs, devices, recordings, commands, alerts, live_stream
+from .routers import auth, incidents, constables, media, settings, websocket, police_stations, audit_logs, devices, recordings, commands, alerts, live_stream, cctv, access_points, presence, deployments
 app.include_router(auth.router)
 app.include_router(incidents.router)
 app.include_router(constables.router)
@@ -67,6 +67,16 @@ app.include_router(recordings.router)
 app.include_router(commands.router)
 app.include_router(alerts.router)
 app.include_router(live_stream.router)
+app.include_router(access_points.router)
+app.include_router(presence.router)
+app.include_router(deployments.router)
+
+# Authorized CCTV monitoring is an optional subsystem (see
+# app/services/cctv_security.py::CCTV_ENABLED) -- disabling it removes the
+# routes entirely (404) rather than leaving them mounted but non-functional.
+from .services.cctv_security import CCTV_ENABLED
+if CCTV_ENABLED:
+    app.include_router(cctv.router)
 
 
 @app.get("/")

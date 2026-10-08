@@ -1,0 +1,1000 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Watch Console</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+  /* Layout concept: fixed left rail of domain tabs, top status bar showing
+     live backend/session state, main panel of data tables + action forms --
+     an operations console, not a marketing page. */
+  :root{
+    --bg:#0b0e13; --surface:#12161e; --surface-2:#191f2a; --border:#232b38;
+    --fg:#e8ecf3; --fg-muted:#8b95a7; --fg-faint:#56607a;
+    --accent:#4c8dff; --accent-fg:#06101f;
+    --good:#34d399; --warn:#f5b942; --bad:#f2555a; --neutral:#5b6578;
+    --mono: 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', monospace;
+    --sans: 'IBM Plex Sans', -apple-system, 'Segoe UI', sans-serif;
+  }
+  @media (prefers-color-scheme: light){
+    :root:not([data-theme="dark"]){
+      --bg:#f3f4f7; --surface:#ffffff; --surface-2:#eceef3; --border:#dde1ea;
+      --fg:#131722; --fg-muted:#565f75; --fg-faint:#8b93a7;
+      --accent:#2f66d9; --accent-fg:#ffffff;
+      --good:#0f9d68; --warn:#b4790a; --bad:#d6373c; --neutral:#6b7489;
+      color-scheme: light;
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#f3f4f7; --surface:#ffffff; --surface-2:#eceef3; --border:#dde1ea;
+    --fg:#131722; --fg-muted:#565f75; --fg-faint:#8b93a7;
+    --accent:#2f66d9; --accent-fg:#ffffff;
+    --good:#0f9d68; --warn:#b4790a; --bad:#d6373c; --neutral:#6b7489;
+    color-scheme: light;
+  }
+  :root, :root[data-theme="dark"]{ color-scheme: dark; }
+
+  /* Defensive: the artifact skeleton injects this with !important, but
+     this page is also meant to work when saved/served standalone (e.g.
+     python -m http.server) outside that skeleton -- without this, a
+     later class rule like `.userbox{display:flex}` silently overrides
+     the native [hidden] behavior regardless of the hidden attribute. */
+  [hidden]{display:none !important}
+  *{box-sizing:border-box}
+  body{background:var(--bg); color:var(--fg); font-family:var(--sans); margin:0; padding-inline:0}
+  h1,h2,h3{font-family:var(--mono); font-weight:600; letter-spacing:.01em; text-wrap:balance; margin:0}
+  table{font-variant-numeric:tabular-nums}
+  ::selection{background:var(--accent); color:var(--accent-fg)}
+  a{color:var(--accent)}
+  button{font-family:var(--sans)}
+  input,select{font-family:var(--sans)}
+
+  .app{display:flex; flex-direction:column; min-height:100%}
+
+  /* ---- top bar ---- */
+  .topbar{
+    display:flex; align-items:center; gap:16px; padding:10px 20px;
+    padding-top: calc(10px + env(safe-area-inset-top,0px));
+    border-bottom:1px solid var(--border); background:var(--surface);
+    position:sticky; top:env(safe-area-inset-top,0px); z-index:20;
+  }
+  .brand{display:flex; align-items:center; gap:10px; font-family:var(--mono); font-size:15px}
+  .brand .dot{width:9px; height:9px; border-radius:50%; background:var(--accent); box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent)}
+  .brand small{color:var(--fg-faint); font-weight:400; margin-left:4px}
+  .spacer{flex:1}
+  .pill{
+    display:inline-flex; align-items:center; gap:6px; font-size:12px; font-family:var(--mono);
+    padding:4px 10px; border-radius:999px; border:1px solid var(--border); background:var(--surface-2); color:var(--fg-muted);
+    white-space:nowrap;
+  }
+  .pill .led{width:7px; height:7px; border-radius:50%; background:var(--neutral); flex:none}
+  .pill.ok .led{background:var(--good); box-shadow:0 0 6px color-mix(in srgb, var(--good) 70%, transparent)}
+  .pill.bad .led{background:var(--bad); box-shadow:0 0 6px color-mix(in srgb, var(--bad) 70%, transparent)}
+  .userbox{display:flex; align-items:center; gap:10px}
+  .userbox .who{font-family:var(--mono); font-size:12px; color:var(--fg-muted)}
+  .userbox .who b{color:var(--fg); font-weight:600}
+
+  .btn{
+    appearance:none; border:1px solid var(--border); background:var(--surface-2); color:var(--fg);
+    padding:7px 13px; border-radius:7px; font-size:13px; cursor:pointer; font-weight:500;
+    transition:border-color .12s, background .12s;
+  }
+  .btn:hover{border-color:var(--accent)}
+  .btn:active{transform:translateY(1px)}
+  .btn:disabled{opacity:.45; cursor:default}
+  .btn.primary{background:var(--accent); border-color:var(--accent); color:var(--accent-fg)}
+  .btn.primary:hover{filter:brightness(1.08)}
+  .btn.danger{border-color:var(--bad); color:var(--bad); background:transparent}
+  .btn.ghost{background:transparent}
+  .btn.small{padding:4px 9px; font-size:12px; border-radius:6px}
+
+  /* ---- shell: rail + main ---- */
+  .shell{display:flex; flex:1; min-height:0}
+  .rail{
+    width:188px; flex:none; border-right:1px solid var(--border); background:var(--surface);
+    padding:14px 10px; display:flex; flex-direction:column; gap:3px;
+  }
+  .rail button{
+    appearance:none; background:transparent; border:none; color:var(--fg-muted); text-align:left;
+    padding:9px 12px; border-radius:7px; font-size:13.5px; cursor:pointer; font-weight:500;
+    display:flex; align-items:center; justify-content:space-between; gap:8px;
+  }
+  .rail button:hover{background:var(--surface-2); color:var(--fg)}
+  .rail button.active{background:color-mix(in srgb, var(--accent) 14%, transparent); color:var(--accent)}
+  .rail .count{font-family:var(--mono); font-size:11px; color:var(--fg-faint); background:var(--surface-2); padding:1px 6px; border-radius:999px}
+  .rail button.active .count{color:var(--accent)}
+  .rail hr{border:none; border-top:1px solid var(--border); margin:10px 2px}
+  .rail .label{font-size:10.5px; text-transform:uppercase; letter-spacing:.08em; color:var(--fg-faint); padding:8px 12px 2px}
+
+  main{flex:1; min-width:0; padding:22px 26px 60px; overflow-y:auto}
+  .view{display:none}
+  .view.active{display:block}
+  .viewhead{display:flex; align-items:baseline; justify-content:space-between; gap:12px; margin-bottom:16px; flex-wrap:wrap}
+  .viewhead h2{font-size:19px}
+  .viewhead p{color:var(--fg-muted); font-size:13px; margin:4px 0 0}
+
+  .grid{display:grid; gap:14px}
+  .grid.two{grid-template-columns: 1.3fr 1fr}
+  @media (max-width: 860px){ .grid.two{grid-template-columns:1fr} .rail{width:150px} main{padding:16px} }
+
+  .card{background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:16px}
+  .card h3{font-size:13px; color:var(--fg-muted); text-transform:uppercase; letter-spacing:.06em; margin-bottom:12px}
+
+  table{width:100%; border-collapse:collapse; font-size:13px}
+  th{text-align:left; color:var(--fg-faint); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:.05em; padding:0 10px 8px; border-bottom:1px solid var(--border)}
+  td{padding:9px 10px; border-bottom:1px solid var(--border); vertical-align:middle}
+  tr:last-child td{border-bottom:none}
+  .tablewrap{overflow-x:auto; border:1px solid var(--border); border-radius:10px; background:var(--surface)}
+  .tablewrap table{border:none}
+  .tablewrap .card-head{display:flex; align-items:center; justify-content:space-between; padding:13px 14px 0}
+  .mono{font-family:var(--mono); font-size:12.5px}
+  .muted{color:var(--fg-muted)}
+  .faint{color:var(--fg-faint)}
+
+  .chip{display:inline-flex; align-items:center; gap:5px; font-family:var(--mono); font-size:11px; padding:2px 8px; border-radius:999px; border:1px solid var(--border); background:var(--surface-2)}
+  .chip .led{width:6px; height:6px; border-radius:50%; background:var(--neutral)}
+  .chip.good{color:var(--good); border-color:color-mix(in srgb, var(--good) 40%, var(--border))} .chip.good .led{background:var(--good)}
+  .chip.warn{color:var(--warn); border-color:color-mix(in srgb, var(--warn) 40%, var(--border))} .chip.warn .led{background:var(--warn)}
+  .chip.bad{color:var(--bad); border-color:color-mix(in srgb, var(--bad) 40%, var(--border))} .chip.bad .led{background:var(--bad)}
+
+  form.inline{display:flex; flex-direction:column; gap:10px}
+  .field{display:flex; flex-direction:column; gap:5px}
+  .field label{font-size:11.5px; color:var(--fg-muted); font-weight:500}
+  .field .hint{font-size:11px; color:var(--fg-faint)}
+  .row2{display:grid; grid-template-columns:1fr 1fr; gap:10px}
+  input[type=text],input[type=number],input[type=password],select,textarea{
+    background:var(--bg); border:1px solid var(--border); color:var(--fg); border-radius:7px;
+    padding:8px 10px; font-size:13px; width:100%;
+  }
+  input:focus,select:focus,textarea:focus{outline:2px solid var(--accent); outline-offset:-1px; border-color:var(--accent)}
+  label.check{display:flex; align-items:center; gap:7px; font-size:13px; color:var(--fg-muted)}
+
+  .empty{padding:30px 14px; text-align:center; color:var(--fg-faint); font-size:13px}
+  .toastbar{position:fixed; bottom:16px; right:16px; display:flex; flex-direction:column; gap:8px; z-index:50; max-width:360px}
+  .toast{background:var(--surface-2); border:1px solid var(--border); border-left:3px solid var(--accent); border-radius:8px; padding:10px 13px; font-size:12.5px; box-shadow:0 8px 24px rgba(0,0,0,.25)}
+  .toast.err{border-left-color:var(--bad)}
+  .toast.ok{border-left-color:var(--good)}
+
+  .loginwrap{display:flex; align-items:center; justify-content:center; min-height:calc(100vh - 54px); padding:20px}
+  .loginbox{width:100%; max-width:380px; background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:26px}
+  .loginbox h2{margin-bottom:4px}
+  .loginbox p.sub{color:var(--fg-muted); font-size:13px; margin:0 0 18px}
+  .quicklogins{display:flex; flex-wrap:wrap; gap:6px; margin-top:16px}
+  .err{color:var(--bad); font-size:12.5px; min-height:16px}
+
+  code.kbd{font-family:var(--mono); background:var(--surface-2); border:1px solid var(--border); padding:1px 5px; border-radius:4px; font-size:11.5px}
+
+  /* ---- modal (replaces native prompt(), which this environment's
+     browser pane does not support at all -- confirmed live: it throws
+     rather than silently no-op'ing) ---- */
+  .modal-overlay{position:fixed; inset:0; background:rgba(0,0,0,.55); display:flex; align-items:center; justify-content:center; z-index:100; padding:20px}
+  .modal-box{background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:22px; width:100%; max-width:380px; display:flex; flex-direction:column; gap:12px}
+  .modal-box h3{font-size:15px}
+  .modal-actions{display:flex; justify-content:flex-end; gap:8px; margin-top:4px}
+</style>
+</head>
+<body>
+
+
+<div class="app" id="app">
+  <div class="topbar">
+    <div class="brand"><span class="dot"></span>WATCH CONSOLE <small>cctv + ap-presence</small></div>
+    <span class="pill" id="apiPill"><span class="led"></span><span id="apiPillText">checking backend&hellip;</span></span>
+    <div class="spacer"></div>
+    <div class="userbox" id="userbox" hidden>
+      <span class="who">signed in as <b id="whoName">&mdash;</b> <span class="faint" id="whoRole"></span></span>
+      <button class="btn small ghost" id="logoutBtn">Sign out</button>
+    </div>
+  </div>
+
+  <div id="loginScreen" class="loginwrap">
+    <div class="loginbox">
+      <h2>Sign in</h2>
+      <p class="sub">Phone + password, against your own running backend.</p>
+      <form class="inline" id="loginForm">
+        <div class="field"><label>Phone</label><input type="text" id="loginPhone" placeholder="9990001001" autocomplete="username"></div>
+        <div class="field"><label>Password</label><input type="password" id="loginPassword" placeholder="Demo@12345" autocomplete="current-password"></div>
+        <div class="err" id="loginErr"></div>
+        <button class="btn primary" type="submit">Sign in</button>
+      </form>
+      <div class="field" style="margin-top:14px">
+        <label>Quick sign-in &mdash; seeded demo accounts</label>
+        <div class="quicklogins" id="quickLogins"></div>
+        <div class="hint" style="margin-top:6px">Run <code class="kbd">seed_demo.py</code> + <code class="kbd">scripts/seed_ap_presence_demo.py</code> first if these fail.</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="mainScreen" class="shell" hidden>
+    <nav class="rail">
+      <div class="label">Monitor</div>
+      <button data-view="cameras" class="active">Cameras <span class="count" id="navCamCount">&ndash;</span></button>
+      <button data-view="aps">Access Points <span class="count" id="navApCount">&ndash;</span></button>
+      <button data-view="zones">Zones <span class="count" id="navZoneCount">&ndash;</span></button>
+      <button data-view="presence">Presence <span class="count" id="navPrCount">&ndash;</span></button>
+      <button data-view="events">Live Events <span class="count" id="navEventsPill">&middot;</span></button>
+      <hr>
+      <div class="label">Police device (demo)</div>
+      <button data-view="virtual">Virtual AP Mode</button>
+      <hr>
+      <div class="label">Session</div>
+      <button data-view="about">About / API</button>
+    </nav>
+
+    <main>
+      <!-- CAMERAS -->
+      <section class="view active" id="view-cameras">
+        <div class="viewhead">
+          <div><h2>CCTV Cameras</h2><p>Authorized cameras only. View/test: admin + control_room. Manage: admin only.</p></div>
+          <button class="btn primary" id="newCameraBtn">+ Register camera</button>
+        </div>
+        <div class="tablewrap">
+          <div class="card-head"><h3 style="margin:0">Registered cameras</h3><button class="btn small" id="refreshCamerasBtn">Refresh</button></div>
+          <div id="camerasTableWrap"></div>
+        </div>
+      </section>
+
+      <!-- ACCESS POINTS -->
+      <section class="view" id="view-aps">
+        <div class="viewhead">
+          <div><h2>Access Points</h2><p>Fixed Wi-Fi AP assets devices associate with. View: admin/control_room/station(own). Manage: admin only.</p></div>
+          <button class="btn primary" id="newApBtn">+ Register access point</button>
+        </div>
+        <div class="tablewrap">
+          <div class="card-head"><h3 style="margin:0">Registered access points</h3><button class="btn small" id="refreshApsBtn">Refresh</button></div>
+          <div id="apsTableWrap"></div>
+        </div>
+      </section>
+
+      <!-- PRESENCE -->
+      <section class="view" id="view-presence">
+        <div class="viewhead">
+          <div><h2>Police Presence</h2><p>Live AP-association state and movement history.</p></div>
+          <button class="btn small" id="refreshPresenceBtn">Refresh</button>
+        </div>
+        <div class="grid two">
+          <div class="tablewrap">
+            <div class="card-head"><h3 style="margin:0">Current presence</h3><span class="faint mono" id="presenceScope"></span></div>
+            <div id="presenceTableWrap"></div>
+          </div>
+          <div class="card" id="associateCard">
+            <h3>Report association</h3>
+            <p class="muted" style="font-size:12.5px; margin-top:-6px">Only the device's own constable can report its presence &mdash; sign in as that constable.</p>
+            <form class="inline" id="associateForm">
+              <div class="field"><label>Device identifier</label><input type="text" id="assocDevice" placeholder="DEV-023"></div>
+              <div class="field"><label>Access point code</label><input type="text" id="assocAp" placeholder="AP-01"></div>
+              <div class="field"><label>Event id <span class="faint">(optional)</span></label><input type="text" id="assocEventId" placeholder="e.g. SIM-0001"></div>
+              <button class="btn primary" type="submit">Send association</button>
+              <div id="assocResult" style="font-size:12.5px"></div>
+            </form>
+            <hr style="border:none; border-top:1px solid var(--border); margin:16px 0">
+            <h3>Movement history</h3>
+            <div class="field"><label>Device id (UUID, from the table)</label><input type="text" id="historyDeviceId" placeholder="paste a device_id"></div>
+            <button class="btn small" id="loadHistoryBtn" style="align-self:flex-start; margin-top:8px">Load history</button>
+            <div id="historyWrap" style="margin-top:10px"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ZONES -->
+      <section class="view" id="view-zones">
+        <div class="viewhead">
+          <div><h2>Zone Dashboard</h2><p>A zone is a live view over Access Points + Presence, not a stored entity &mdash; see docs/VIRTUAL_AP_POLICE_PRESENCE.md.</p></div>
+          <button class="btn small" id="refreshZonesBtn">Refresh</button>
+        </div>
+        <div class="grid" id="zonesGrid" style="grid-template-columns:repeat(auto-fill, minmax(220px, 1fr))"></div>
+      </section>
+
+      <!-- LIVE EVENTS -->
+      <section class="view" id="view-events">
+        <div class="viewhead">
+          <div><h2>Live Event Console</h2><p>A real WebSocket connection to <code class="kbd">/ws/control_room</code> &mdash; only admin/control_room/station/constable rooms receive anything; events shown here are not simulated.</p></div>
+          <span class="pill" id="wsPill"><span class="led"></span><span id="wsPillText">disconnected</span></span>
+        </div>
+        <div class="tablewrap">
+          <div class="card-head"><h3 style="margin:0">Event log</h3><button class="btn small" id="clearEventsBtn">Clear</button></div>
+          <div id="eventsLog" style="padding:10px 14px; max-height:520px; overflow-y:auto; font-family:var(--mono); font-size:12px"></div>
+        </div>
+      </section>
+
+      <!-- VIRTUAL AP MODE -->
+      <section class="view" id="view-virtual">
+        <div class="viewhead">
+          <div><h2>Virtual AP Mode <span class="chip warn" style="margin-left:6px"><span class="led"></span>DEMO MODE</span></h2>
+          <p>Simulates AP association for development/demonstration only &mdash; never a real Wi-Fi association. Constable-only; uses your own registered device.</p></div>
+        </div>
+        <div id="virtualNotConstable" class="card"><p class="muted">Sign in as a constable (e.g. POL-023) to use Virtual AP Mode.</p></div>
+        <div id="virtualPanel" class="grid two" hidden>
+          <div class="card">
+            <h3>Current status</h3>
+            <div id="virtualStatusBox" style="font-size:13px; line-height:1.9"></div>
+            <div class="field" style="margin-top:14px"><label>Your device identifier</label><input type="text" id="virtualDeviceId" placeholder="DEV-023"></div>
+            <button class="btn small" id="virtualRefreshBtn" style="margin-top:8px; align-self:flex-start">Refresh status</button>
+          </div>
+          <div class="card">
+            <h3>Select destination</h3>
+            <div id="virtualApList" style="display:flex; flex-direction:column; gap:6px; margin-bottom:14px"></div>
+            <div class="field"><label>Destination</label><div id="virtualDestination" class="mono faint">none selected</div></div>
+            <button class="btn primary" id="virtualGoBtn" style="margin-top:10px" disabled>GO</button>
+            <div id="virtualMoveLog" style="margin-top:14px; font-family:var(--mono); font-size:12px; display:flex; flex-direction:column; gap:4px"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ABOUT -->
+      <section class="view" id="view-about">
+        <div class="viewhead"><div><h2>About this console</h2></div></div>
+        <div class="card" style="max-width:560px">
+          <h3>Connection</h3>
+          <div class="field">
+            <label>Backend base URL</label>
+            <input type="text" id="apiBaseInput">
+            <div class="hint">Saved locally in this browser only. Default assumes the backend is running on the same machine you're viewing this page from.</div>
+          </div>
+          <button class="btn small" id="saveApiBaseBtn" style="margin-top:10px">Save &amp; recheck</button>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="toastbar" id="toastbar"></div>
+
+  <div class="modal-overlay" id="modalOverlay" hidden>
+    <div class="modal-box">
+      <h3 id="modalTitle"></h3>
+      <div id="modalFields" style="display:flex; flex-direction:column; gap:10px"></div>
+      <div class="modal-actions">
+        <button class="btn ghost" id="modalCancelBtn" type="button">Cancel</button>
+        <button class="btn primary" id="modalOkBtn" type="button">OK</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  // ---------- storage helpers (per-viewer convenience only) ----------
+  const store = {
+    get(k, fallback){ try{ const v = localStorage.getItem(k); return v===null? fallback : v; }catch(e){ return fallback; } },
+    set(k, v){ try{ localStorage.setItem(k, v); }catch(e){} },
+    del(k){ try{ localStorage.removeItem(k); }catch(e){} },
+  };
+
+  let API_BASE = store.get('wc_api_base', 'http://localhost:8000');
+  let TOKEN = store.get('wc_token', '');
+  let ME = null; // {id, phone, role, ...}
+
+  const $ = (sel, root=document) => root.querySelector(sel);
+  const $$ = (sel, root=document) => Array.from(root.querySelectorAll(sel));
+
+  function toast(msg, kind='ok'){
+    const bar = $('#toastbar');
+    const el = document.createElement('div');
+    el.className = 'toast ' + (kind==='err'?'err':'ok');
+    el.textContent = msg;
+    bar.appendChild(el);
+    setTimeout(()=>{ el.style.opacity='0'; el.style.transition='opacity .3s'; setTimeout(()=>el.remove(), 320); }, 4200);
+  }
+
+  async function api(path, opts={}){
+    const headers = Object.assign({'Content-Type':'application/json'}, opts.headers||{});
+    if (TOKEN) headers['Authorization'] = 'Bearer ' + TOKEN;
+    let res;
+    try{
+      res = await fetch(API_BASE + path, Object.assign({}, opts, {headers}));
+    }catch(e){
+      throw new Error('Could not reach backend at ' + API_BASE + ' -- is it running? (' + e.message + ')');
+    }
+    let body = null;
+    const text = await res.text();
+    try{ body = text ? JSON.parse(text) : null; }catch(e){ body = text; }
+    if (!res.ok){
+      const detail = (body && body.detail) ? (typeof body.detail==='string'? body.detail : JSON.stringify(body.detail)) : (res.status + ' ' + res.statusText);
+      const err = new Error(detail);
+      err.status = res.status;
+      throw err;
+    }
+    return body;
+  }
+
+  // ---------- backend connectivity pill ----------
+  async function checkBackend(){
+    const pill = $('#apiPill'), txt = $('#apiPillText');
+    try{
+      await api('/');
+      pill.classList.add('ok'); pill.classList.remove('bad');
+      txt.textContent = 'backend online';
+    }catch(e){
+      pill.classList.add('bad'); pill.classList.remove('ok');
+      txt.textContent = 'backend unreachable';
+    }
+  }
+
+  // ---------- auth ----------
+  const DEMO_ACCOUNTS = [
+    {label:'admin', phone:'9990001001'},
+    {label:'control_room', phone:'9990001002'},
+    {label:'station', phone:'9990001003'},
+    {label:'constable', phone:'9990001004'},
+    {label:'citizen', phone:'9990001005'},
+    {label:'POL-023 (DEV-023)', phone:'9990003023'},
+    {label:'POL-024 (DEV-024)', phone:'9990003024'},
+    {label:'POL-025 (DEV-025)', phone:'9990003025'},
+  ];
+  const DEMO_PASSWORD = 'Demo@12345';
+
+  function renderQuickLogins(){
+    const wrap = $('#quickLogins');
+    wrap.innerHTML = '';
+    DEMO_ACCOUNTS.forEach(acc => {
+      const b = document.createElement('button');
+      b.className = 'btn small';
+      b.textContent = acc.label;
+      b.addEventListener('click', () => doLogin(acc.phone, DEMO_PASSWORD));
+      wrap.appendChild(b);
+    });
+  }
+
+  async function doLogin(phone, password){
+    $('#loginErr').textContent = '';
+    try{
+      const resp = await api('/auth/login', {method:'POST', body: JSON.stringify({username: phone, password})});
+      TOKEN = resp.access_token;
+      ME = resp.user;
+      store.set('wc_token', TOKEN);
+      showMain();
+    }catch(e){
+      $('#loginErr').textContent = e.message;
+    }
+  }
+
+  async function restoreSession(){
+    if (!TOKEN) return false;
+    try{
+      ME = await api('/auth/me');
+      return true;
+    }catch(e){
+      TOKEN = ''; store.del('wc_token');
+      return false;
+    }
+  }
+
+  function showLogin(){
+    $('#loginScreen').hidden = false;
+    $('#mainScreen').hidden = true;
+    $('#userbox').hidden = true;
+  }
+
+  function showMain(){
+    $('#loginScreen').hidden = true;
+    $('#mainScreen').hidden = false;
+    $('#userbox').hidden = false;
+    $('#whoName').textContent = ME.phone;
+    $('#whoRole').textContent = '(' + ME.role + ')';
+    renderAssociateVisibility();
+    renderVirtualVisibility();
+    connectLiveEvents();
+    refreshAll();
+  }
+
+  $('#loginForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    doLogin($('#loginPhone').value.trim(), $('#loginPassword').value);
+  });
+  $('#logoutBtn').addEventListener('click', () => {
+    try{ if (ws) ws.close(); }catch(e){}
+    TOKEN=''; ME=null; store.del('wc_token'); showLogin();
+  });
+
+  // ---------- nav ----------
+  $$('.rail button[data-view]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      $$('.rail button[data-view]').forEach(b=>b.classList.remove('active'));
+      btn.classList.add('active');
+      $$('.view').forEach(v=>v.classList.remove('active'));
+      $('#view-' + btn.dataset.view).classList.add('active');
+    });
+  });
+
+  // ---------- status chip helpers ----------
+  function statusChip(status, map){
+    const kind = (map && map[status]) || 'warn';
+    return `<span class="chip ${kind}"><span class="led"></span>${status}</span>`;
+  }
+  const CAM_STATUS_MAP = {online:'good', offline:'bad', degraded:'warn', unknown:'warn', disabled:'bad'};
+  const AP_STATUS_MAP = {online:'good', offline:'bad'};
+  const PRESENCE_STATUS_MAP = {connected:'good', stale:'warn', disconnected:'bad'};
+
+  function fmtTime(iso){
+    if (!iso) return '&mdash;';
+    try{ return new Date(iso).toLocaleString(); }catch(e){ return iso; }
+  }
+
+  // ---------- CAMERAS ----------
+  async function loadCameras(){
+    const wrap = $('#camerasTableWrap');
+    try{
+      const cams = await api('/cctv/cameras');
+      $('#navCamCount').textContent = cams.length;
+      if (!cams.length){ wrap.innerHTML = '<div class="empty">No cameras registered yet. Click "Register camera" or run <code class="kbd">scripts/seed_cctv_demo.py</code>.</div>'; return; }
+      wrap.innerHTML = `<table><thead><tr>
+        <th>Code</th><th>Name</th><th>Target</th><th>Status</th><th>Enabled</th><th>Credentials</th><th>Demo</th><th></th>
+      </tr></thead><tbody>${cams.map(c => `
+        <tr data-id="${c.id}">
+          <td class="mono">${c.camera_code}</td>
+          <td>${escapeHtml(c.name)}${c.zone? `<div class="faint" style="font-size:11px">${escapeHtml(c.zone)}</div>`:''}</td>
+          <td class="mono faint">${c.stream_protocol}://${c.stream_host}:${c.stream_port}${c.stream_path||''}</td>
+          <td>${statusChip(c.status, CAM_STATUS_MAP)}</td>
+          <td>${c.enabled? '<span class="chip good"><span class="led"></span>on</span>' : '<span class="chip bad"><span class="led"></span>off</span>'}</td>
+          <td class="faint">${c.credentials_configured? 'configured':'none'}</td>
+          <td class="faint">${c.is_demo? 'demo':''}</td>
+          <td style="white-space:nowrap">
+            <button class="btn small" data-act="test">Test</button>
+            <button class="btn small" data-act="${c.enabled?'disable':'enable'}">${c.enabled?'Disable':'Enable'}</button>
+            <button class="btn small danger" data-act="delete">Delete</button>
+          </td>
+        </tr>`).join('')}</tbody></table>`;
+      wrap.querySelectorAll('tr[data-id]').forEach(row => {
+        const id = row.dataset.id;
+        row.querySelectorAll('button[data-act]').forEach(btn => {
+          btn.addEventListener('click', async () => {
+            const act = btn.dataset.act;
+            btn.disabled = true;
+            try{
+              if (act==='test'){
+                const r = await api(`/cctv/cameras/${id}/test`, {method:'POST'});
+                toast(`Test result: ${r.status}${r.latency_ms? ' ('+Math.round(r.latency_ms)+'ms)':''}`, r.status==='online'?'ok':'err');
+              } else if (act==='enable' || act==='disable'){
+                await api(`/cctv/cameras/${id}/${act}`, {method:'POST'});
+                toast(`Camera ${act}d`);
+              } else if (act==='delete'){
+                await api(`/cctv/cameras/${id}`, {method:'DELETE'});
+                toast('Camera deleted');
+              }
+              loadCameras();
+            }catch(e){ toast(e.message, 'err'); }
+            btn.disabled = false;
+          });
+        });
+      });
+    }catch(e){
+      wrap.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
+      $('#navCamCount').textContent = '!';
+    }
+  }
+  $('#refreshCamerasBtn').addEventListener('click', loadCameras);
+
+  $('#newCameraBtn').addEventListener('click', async () => {
+    const r = await showModal('Register camera', [
+      {key:'name', label:'Camera name', value:'New Camera'},
+      {key:'camera_code', label:'Camera code (unique)', value:'CAM-' + Math.random().toString(36).slice(2,7).toUpperCase()},
+      {key:'stream_host', label:'Stream host (SSRF-allowlisted, e.g. 127.0.0.1)', value:'127.0.0.1'},
+      {key:'stream_port', label:'Stream port', value:'554', type:'number'},
+      {key:'latitude', label:'Latitude', value:'20.50', type:'number'},
+      {key:'longitude', label:'Longitude', value:'78.90', type:'number'},
+    ]);
+    if (!r || !r.name || !r.camera_code || !r.stream_host) return;
+    try{
+      await api('/cctv/cameras', {method:'POST', body: JSON.stringify({
+        name: r.name, camera_code: r.camera_code, stream_host: r.stream_host,
+        stream_port: Number(r.stream_port) || 554, latitude: Number(r.latitude), longitude: Number(r.longitude),
+      })});
+      toast('Camera registered'); loadCameras();
+    }catch(e){ toast(e.message, 'err'); }
+  });
+
+  // ---------- ACCESS POINTS ----------
+  async function loadAps(){
+    const wrap = $('#apsTableWrap');
+    try{
+      const aps = await api('/access-points/');
+      $('#navApCount').textContent = aps.length;
+      if (!aps.length){ wrap.innerHTML = '<div class="empty">No access points yet. Run <code class="kbd">scripts/seed_ap_presence_demo.py</code> or register one.</div>'; return; }
+      wrap.innerHTML = `<table><thead><tr>
+        <th>Code</th><th>Name</th><th>Zone</th><th>Deployment</th><th>Status</th><th>Enabled</th><th>Devices here</th><th></th>
+      </tr></thead><tbody>${aps.map(a => `
+        <tr data-id="${a.id}">
+          <td class="mono">${a.code}</td>
+          <td>${escapeHtml(a.name)}</td>
+          <td class="faint">${a.zone||'&mdash;'}</td>
+          <td class="faint">${a.deployment||'&mdash;'}</td>
+          <td>${statusChip(a.status, AP_STATUS_MAP)}</td>
+          <td>${a.enabled? '<span class="chip good"><span class="led"></span>on</span>' : '<span class="chip bad"><span class="led"></span>off</span>'}</td>
+          <td class="mono">${a.associated_device_count ?? 0}</td>
+          <td style="white-space:nowrap">
+            <button class="btn small" data-act="${a.enabled?'disable':'enable'}">${a.enabled?'Disable':'Enable'}</button>
+            <button class="btn small danger" data-act="delete">Delete</button>
+          </td>
+        </tr>`).join('')}</tbody></table>`;
+      wrap.querySelectorAll('tr[data-id]').forEach(row => {
+        const id = row.dataset.id;
+        row.querySelectorAll('button[data-act]').forEach(btn => {
+          btn.addEventListener('click', async () => {
+            const act = btn.dataset.act; btn.disabled = true;
+            try{
+              if (act==='delete'){ await api(`/access-points/${id}`, {method:'DELETE'}); toast('Access point deleted'); }
+              else { await api(`/access-points/${id}/${act}`, {method:'POST'}); toast(`Access point ${act}d`); }
+              loadAps();
+            }catch(e){ toast(e.message, 'err'); }
+            btn.disabled = false;
+          });
+        });
+      });
+    }catch(e){
+      wrap.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
+      $('#navApCount').textContent = '!';
+    }
+  }
+  $('#refreshApsBtn').addEventListener('click', loadAps);
+
+  $('#newApBtn').addEventListener('click', async () => {
+    const r = await showModal('Register access point', [
+      {key:'name', label:'Access point name', value:'New Gate'},
+      {key:'code', label:'AP code (unique)', value:'AP-' + Math.random().toString(36).slice(2,6).toUpperCase()},
+      {key:'zone', label:'Zone label (optional)', value:''},
+    ]);
+    if (!r || !r.name || !r.code) return;
+    try{
+      await api('/access-points/', {method:'POST', body: JSON.stringify({name: r.name, code: r.code, zone: r.zone || null})});
+      toast('Access point registered'); loadAps(); loadZones();
+    }catch(e){ toast(e.message, 'err'); }
+  });
+
+  // ---------- PRESENCE ----------
+  function renderAssociateVisibility(){
+    const card = $('#associateCard');
+    if (!ME) return;
+    // Explicit both ways -- this runs once per login, and the DOM persists
+    // across a sign-out/sign-in cycle in this single-page app, so a
+    // one-directional "hide if not constable" would leave the form hidden
+    // forever once any non-constable session had been active (confirmed
+    // the hard way: signed in as admin, signed out, signed in as a
+    // constable, and the form stayed hidden).
+    card.querySelector('#associateForm').hidden = (ME.role !== 'constable');
+  }
+
+  async function loadPresence(){
+    const wrap = $('#presenceTableWrap');
+    $('#presenceScope').textContent = ME ? ME.role : '';
+    try{
+      const rows = ME.role === 'constable' ? await api('/presence/me') : await api('/presence/');
+      $('#navPrCount').textContent = rows.length;
+      if (!rows.length){ wrap.innerHTML = '<div class="empty">No presence records yet. Send an association below (or via scripts/seed_ap_presence_demo.py + a few POST /presence/association calls).</div>'; return; }
+      wrap.innerHTML = `<table><thead><tr>
+        <th>Device</th><th>Current AP</th><th>Zone</th><th>Status</th><th>Handoffs</th><th>Last seen</th>
+      </tr></thead><tbody>${rows.map(p => `
+        <tr>
+          <td class="mono" title="${p.device_id}">${p.device_id.slice(0,8)}&hellip;</td>
+          <td class="mono">${p.current_access_point_code||'&mdash;'}</td>
+          <td class="faint">${p.current_zone||'&mdash;'}</td>
+          <td>${statusChip(p.status, PRESENCE_STATUS_MAP)}</td>
+          <td class="mono">${p.handoff_count}</td>
+          <td class="faint">${fmtTime(p.last_seen_at)}</td>
+        </tr>`).join('')}</tbody></table>`;
+    }catch(e){
+      wrap.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
+      $('#navPrCount').textContent = '!';
+    }
+  }
+  $('#refreshPresenceBtn').addEventListener('click', loadPresence);
+
+  $('#associateForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const device_identifier = $('#assocDevice').value.trim();
+    const access_point_code = $('#assocAp').value.trim();
+    const event_id = $('#assocEventId').value.trim() || undefined;
+    const out = $('#assocResult');
+    out.textContent = 'Sending…'; out.className = '';
+    try{
+      const r = await api('/presence/association', {method:'POST', body: JSON.stringify({device_identifier, access_point_code, event_id})});
+      out.textContent = `${r.status} -- now at ${r.presence.current_access_point_code}, handoffs=${r.presence.handoff_count}`;
+      out.style.color = 'var(--good)';
+      loadPresence();
+    }catch(e){
+      out.textContent = e.message; out.style.color = 'var(--bad)';
+    }
+  });
+
+  $('#loadHistoryBtn').addEventListener('click', async () => {
+    const id = $('#historyDeviceId').value.trim();
+    const wrap = $('#historyWrap');
+    if (!id){ wrap.innerHTML = '<div class="faint" style="font-size:12px">Paste a device_id first (click a row\'s device cell to copy it, or use the device table).</div>'; return; }
+    try{
+      const rows = await api(`/presence/devices/${id}/history`);
+      if (!rows.length){ wrap.innerHTML = '<div class="faint" style="font-size:12px">No movement history for this device yet.</div>'; return; }
+      wrap.innerHTML = rows.map(h => `
+        <div style="display:flex; justify-content:space-between; gap:8px; padding:6px 0; border-bottom:1px solid var(--border); font-size:12.5px">
+          <span class="mono">${h.previous_access_point_id? 'handoff' : 'first seen'}</span>
+          <span class="faint">${fmtTime(h.occurred_at)}</span>
+        </div>`).join('');
+    }catch(e){ wrap.innerHTML = `<div class="faint" style="font-size:12px">${escapeHtml(e.message)}</div>`; }
+  });
+
+  // ---------- ZONES ----------
+  async function loadZones(){
+    const grid = $('#zonesGrid');
+    try{
+      const zones = await api('/access-points/zones');
+      $('#navZoneCount').textContent = zones.length;
+      if (!zones.length){ grid.innerHTML = '<div class="empty">No zones yet &mdash; register an access point with a zone label, or run <code class="kbd">scripts/seed_ap_presence_demo.py</code>.</div>'; return; }
+      grid.innerHTML = zones.map(z => `
+        <div class="card" data-zone="${escapeHtml(z.zone)}">
+          <h3 style="display:flex; justify-content:space-between; align-items:center">
+            <span>${escapeHtml(z.zone)}</span>
+            ${z.enabled? '<span class="chip good"><span class="led"></span>on</span>' : '<span class="chip bad"><span class="led"></span>off</span>'}
+          </h3>
+          <div style="font-size:26px; font-family:var(--mono); font-weight:600">${z.police_count}<span style="font-size:12px; color:var(--fg-faint); font-weight:400"> police</span></div>
+          ${z.moving_count ? `<div class="faint" style="font-size:12px; margin-top:2px">${z.moving_count} moving in</div>` : ''}
+          <div class="faint" style="font-size:11.5px; margin-top:8px">APs: ${z.access_point_codes.join(', ')}</div>
+          <div style="display:flex; gap:6px; margin-top:12px; flex-wrap:wrap">
+            <button class="btn small" data-zact="${z.enabled?'disable':'enable'}">${z.enabled?'Disable zone':'Enable zone'}</button>
+            <button class="btn small danger" data-zact="alert">Alert zone</button>
+          </div>
+        </div>`).join('');
+      grid.querySelectorAll('[data-zone]').forEach(card => {
+        const zone = card.dataset.zone;
+        card.querySelectorAll('button[data-zact]').forEach(btn => {
+          btn.addEventListener('click', async () => {
+            const act = btn.dataset.zact;
+            if (act === 'alert'){
+              const r = await showModal(`Alert ${zone}`, [
+                {key:'message', label:`Message to every officer currently connected in ${zone}`, value:`EMERGENCY IN ${zone} -- RESPOND IMMEDIATELY`},
+              ]);
+              const message = r && r.message;
+              if (!message) return;
+              try{
+                const r = await api(`/presence/zones/${encodeURIComponent(zone)}/alert`, {method:'POST', body: JSON.stringify({message})});
+                toast(`Alert sent to ${r.targeted_device_count} officer(s) in ${zone}`);
+              }catch(e){ toast(e.message, 'err'); }
+              return;
+            }
+            btn.disabled = true;
+            try{
+              await api(`/access-points/zones/${encodeURIComponent(zone)}/${act}`, {method:'POST'});
+              toast(`Zone ${zone} ${act}d`);
+              loadZones(); loadAps();
+            }catch(e){ toast(e.message, 'err'); }
+            btn.disabled = false;
+          });
+        });
+      });
+    }catch(e){
+      grid.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
+      $('#navZoneCount').textContent = '!';
+    }
+  }
+  $('#refreshZonesBtn').addEventListener('click', loadZones);
+
+  // ---------- LIVE EVENTS (real WebSocket) ----------
+  let ws = null;
+  function wsUrlFor(base, token){
+    const u = new URL(base);
+    u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+    u.pathname = '/ws/control_room';
+    u.search = '?token=' + encodeURIComponent(token);
+    return u.toString();
+  }
+  function logEvent(obj){
+    const log = $('#eventsLog');
+    const line = document.createElement('div');
+    line.style.cssText = 'padding:4px 0; border-bottom:1px solid var(--border)';
+    const t = obj.timestamp ? new Date(obj.timestamp).toLocaleTimeString() : '';
+    line.innerHTML = `<span class="faint">[${t}]</span> <span style="color:var(--accent)">${escapeHtml(obj.event||'?')}</span> ${escapeHtml(JSON.stringify(obj.data||{}))}`;
+    log.prepend(line);
+    while (log.children.length > 300) log.removeChild(log.lastChild);
+  }
+  function connectLiveEvents(){
+    if (!TOKEN) return;
+    try{ if (ws) ws.close(); }catch(e){}
+    const pill = $('#wsPill'), txt = $('#wsPillText');
+    try{
+      ws = new WebSocket(wsUrlFor(API_BASE, TOKEN));
+    }catch(e){
+      txt.textContent = 'failed to connect'; pill.classList.add('bad'); return;
+    }
+    ws.onopen = () => { pill.classList.add('ok'); pill.classList.remove('bad'); txt.textContent = 'connected (' + (ME? ME.role : '') + ' room)'; };
+    ws.onclose = () => { pill.classList.remove('ok'); pill.classList.add('bad'); txt.textContent = 'disconnected'; };
+    ws.onerror = () => { pill.classList.remove('ok'); pill.classList.add('bad'); txt.textContent = 'error'; };
+    ws.onmessage = (evt) => {
+      let obj; try{ obj = JSON.parse(evt.data); }catch(e){ return; }
+      if (obj.event === 'ack') return; // keep-alive ack only
+      logEvent(obj);
+      if (obj.event === 'zone.emergency_alert') toast(`ZONE ALERT (${obj.data.zone}): ${obj.data.message}`, 'err');
+    };
+  }
+  $('#clearEventsBtn').addEventListener('click', () => { $('#eventsLog').innerHTML = ''; });
+
+  // ---------- VIRTUAL AP MODE ----------
+  let virtualDestination = null; // {code, name, zone}
+  let virtualPollTimer = null;
+
+  function renderVirtualVisibility(){
+    const isConstable = ME && ME.role === 'constable';
+    $('#virtualNotConstable').hidden = isConstable;
+    $('#virtualPanel').hidden = !isConstable;
+    if (isConstable){
+      // Reset per-session state on every fresh login -- otherwise the
+      // previous signed-in constable's device identifier and selected
+      // destination silently carry over into the new session (confirmed
+      // live: signing in as a different constable right after another
+      // left the prior one's device id sitting in the input). The
+      // backend's own ownership check would still reject a mismatched
+      // device, but the UI must not show stale identity either.
+      $('#virtualDeviceId').value = '';
+      virtualDestination = null;
+      $('#virtualDestination').textContent = 'none selected';
+      $('#virtualGoBtn').disabled = true;
+      $('#virtualMoveLog').innerHTML = '';
+      loadVirtualPanel();
+    }
+  }
+
+  async function loadVirtualPanel(){
+    const box = $('#virtualStatusBox');
+    if (!$('#virtualDeviceId').value.trim()){
+      try{
+        const devices = await api('/devices/');
+        if (devices.length) $('#virtualDeviceId').value = devices[0].device_identifier;
+      }catch(e){ /* best-effort autofill only */ }
+    }
+    try{
+      const rows = await api('/presence/me');
+      if (!rows.length){
+        box.innerHTML = '<span class="faint">No presence yet &mdash; pick a destination below and press GO to connect for the first time.</span>';
+      } else {
+        const p = rows[0];
+        box.innerHTML = `
+          Current AP: <b class="mono">${p.current_access_point_code||'&mdash;'}</b><br>
+          Current Zone: <b class="mono">${p.current_zone||'&mdash;'}</b><br>
+          Status: ${statusChip(p.status, PRESENCE_STATUS_MAP)}<br>
+          Handoffs: <span class="mono">${p.handoff_count}</span>`;
+      }
+      await loadVirtualApList();
+    }catch(e){
+      box.innerHTML = `<span class="faint">${escapeHtml(e.message)}</span>`;
+    }
+  }
+  $('#virtualRefreshBtn').addEventListener('click', loadVirtualPanel);
+
+  async function loadVirtualApList(){
+    const wrap = $('#virtualApList');
+    try{
+      const aps = await api('/presence/virtual/map');
+      if (!aps.length){ wrap.innerHTML = '<div class="faint" style="font-size:12px">No enabled access points yet.</div>'; return; }
+      wrap.innerHTML = aps.map(a => `<button class="btn small" data-destcode="${a.code}" data-destname="${escapeHtml(a.name)}" data-destzone="${escapeHtml(a.zone||'')}" style="text-align:left">${a.code} &mdash; ${escapeHtml(a.name)} <span class="faint">(${escapeHtml(a.zone||'')})</span></button>`).join('');
+      wrap.querySelectorAll('button[data-destcode]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          virtualDestination = {code: btn.dataset.destcode, name: btn.dataset.destname, zone: btn.dataset.destzone};
+          $('#virtualDestination').textContent = `${virtualDestination.code} -- ${virtualDestination.name} (${virtualDestination.zone})`;
+          $('#virtualGoBtn').disabled = false;
+        });
+      });
+    }catch(e){
+      wrap.innerHTML = `<div class="faint" style="font-size:12px">${escapeHtml(e.message)}</div>`;
+    }
+  }
+
+  function moveLog(msg){
+    const el = $('#virtualMoveLog');
+    const line = document.createElement('div');
+    line.textContent = msg;
+    el.prepend(line);
+  }
+
+  $('#virtualGoBtn').addEventListener('click', async () => {
+    const deviceId = $('#virtualDeviceId').value.trim();
+    if (!deviceId){ toast('Enter your device identifier first', 'err'); return; }
+    if (!virtualDestination){ return; }
+    const btn = $('#virtualGoBtn');
+    btn.disabled = true;
+    $('#virtualMoveLog').innerHTML = '';
+    moveLog(`Moving to ${virtualDestination.code} -- ${virtualDestination.name}...`);
+
+    // Client-side animation only -- the backend never sees per-frame
+    // progress as a stored fact, only as a transient WS passthrough
+    // (see docs/VIRTUAL_AP_POLICE_PRESENCE.md, "do not store every
+    // animation frame"). A couple of moving-pings at a controlled
+    // interval, never per-frame.
+    const steps = [20, 50, 80];
+    for (const progress of steps){
+      await new Promise(r => setTimeout(r, 450));
+      moveLog(`${progress}%...`);
+      try{
+        await api('/presence/virtual/moving-ping', {method:'POST', body: JSON.stringify({
+          device_identifier: deviceId, target_access_point_code: virtualDestination.code, progress,
+        })});
+      }catch(e){ /* best-effort -- never blocks the actual arrival below */ }
+    }
+    await new Promise(r => setTimeout(r, 300));
+    moveLog(`DISCONNECTED (previous AP)`);
+    moveLog(`CONNECTING to ${virtualDestination.code}...`);
+
+    try{
+      const r = await api('/presence/association/virtual', {method:'POST', body: JSON.stringify({
+        device_identifier: deviceId, access_point_code: virtualDestination.code,
+      })});
+      moveLog(`CONNECTED to ${virtualDestination.code} (${r.status})`);
+      toast(`${r.status === 'handoff' ? 'Handoff' : 'Connected'} to ${virtualDestination.code}`);
+      loadVirtualPanel();
+      loadPresence(); loadZones();
+    }catch(e){
+      moveLog(`FAILED: ${e.message}`);
+      toast(e.message, 'err');
+    }
+    btn.disabled = false;
+  });
+
+  // ---------- about / api base ----------
+  $('#apiBaseInput').value = API_BASE;
+  $('#saveApiBaseBtn').addEventListener('click', () => {
+    API_BASE = $('#apiBaseInput').value.trim().replace(/\/$/, '') || 'http://localhost:8000';
+    store.set('wc_api_base', API_BASE);
+    checkBackend();
+    toast('API base updated');
+  });
+
+  // ---------- modal (replaces native prompt()) ----------
+  // fields: [{key, label, placeholder, value, type}] -- returns a
+  // Promise resolving to {key: value, ...} or null if cancelled.
+  function showModal(title, fields){
+    return new Promise((resolve) => {
+      $('#modalTitle').textContent = title;
+      const fieldsWrap = $('#modalFields');
+      fieldsWrap.innerHTML = fields.map((f, i) => `
+        <div class="field">
+          <label>${escapeHtml(f.label)}</label>
+          <input type="${f.type||'text'}" id="modalField${i}" placeholder="${escapeHtml(f.placeholder||'')}" value="${escapeHtml(f.value!=null? String(f.value):'')}">
+        </div>`).join('');
+      const overlay = $('#modalOverlay');
+      overlay.hidden = false;
+      const firstInput = $('#modalField0');
+      if (firstInput) firstInput.focus();
+
+      function cleanup(){
+        overlay.hidden = true;
+        okBtn.removeEventListener('click', onOk);
+        cancelBtn.removeEventListener('click', onCancel);
+        overlay.removeEventListener('keydown', onKeydown);
+      }
+      function onOk(){
+        const result = {};
+        fields.forEach((f, i) => { result[f.key] = $('#modalField' + i).value; });
+        cleanup();
+        resolve(result);
+      }
+      function onCancel(){ cleanup(); resolve(null); }
+      function onKeydown(e){
+        if (e.key === 'Escape'){ onCancel(); }
+        if (e.key === 'Enter'){ onOk(); }
+      }
+      const okBtn = $('#modalOkBtn'), cancelBtn = $('#modalCancelBtn');
+      okBtn.addEventListener('click', onOk);
+      cancelBtn.addEventListener('click', onCancel);
+      overlay.addEventListener('keydown', onKeydown);
+    });
+  }
+
+  function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  function refreshAll(){
+    loadCameras(); loadAps(); loadPresence(); loadZones();
+  }
+
+  // ---------- boot ----------
+  (async function init(){
+    renderQuickLogins();
+    checkBackend();
+    setInterval(checkBackend, 15000);
+    const ok = await restoreSession();
+    if (ok) showMain(); else showLogin();
+  })();
+})();
+</script>
+
+</body>
+</html>

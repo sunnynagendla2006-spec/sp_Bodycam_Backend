@@ -439,3 +439,184 @@ async def publish_live_stream_ended(session: models.LiveStreamSession, station_i
     event = build_event("live_stream.ended", _live_stream_summary(session))
     await manager.send_to_control_room(event)
     await manager.send_to_station(station_id, event)
+
+
+# ---------------------------------------------------------------------------
+# Authorized CCTV monitoring. Deliberately sent ONLY to control_room --
+# never to any station or constable room. This is what actually enforces
+# "only admin/control_room receive CCTV events" on the WebSocket side:
+# app/routers/websocket.py only ever places admin/control_room connections
+# into the control_room room in the first place, so a station/constable
+# connection can never be reachable through send_to_control_room even if
+# this code tried. See app/routers/cctv.py for the REST-side RBAC that
+# mirrors this.
+# ---------------------------------------------------------------------------
+
+def _cctv_camera_summary(camera: models.CCTVCamera) -> dict:
+    """Never includes username/encrypted_secret/stream_host/stream_port -- WS payloads get the same no-credentials, no-connection-target treatment as REST responses."""
+    return {
+        "camera_id": str(camera.id),
+        "camera_code": camera.camera_code,
+        "name": camera.name,
+        "station_id": str(camera.station_id) if camera.station_id else None,
+        "enabled": camera.enabled,
+        "status": camera.status.value if camera.status else None,
+    }
+
+
+async def publish_cctv_registered(camera: models.CCTVCamera):
+    await manager.send_to_control_room(build_event("cctv.registered", _cctv_camera_summary(camera)))
+
+
+async def publish_cctv_updated(camera: models.CCTVCamera):
+    await manager.send_to_control_room(build_event("cctv.updated", _cctv_camera_summary(camera)))
+
+
+async def publish_cctv_deleted(camera_id: uuid.UUID):
+    await manager.send_to_control_room(build_event("cctv.deleted", {"camera_id": str(camera_id)}))
+
+
+async def publish_cctv_enabled(camera: models.CCTVCamera):
+    await manager.send_to_control_room(build_event("cctv.enabled", _cctv_camera_summary(camera)))
+
+
+async def publish_cctv_disabled(camera: models.CCTVCamera):
+    await manager.send_to_control_room(build_event("cctv.disabled", _cctv_camera_summary(camera)))
+
+
+async def publish_cctv_status_changed(camera: models.CCTVCamera, old_status: str, new_status: str):
+    payload = _cctv_camera_summary(camera)
+    payload["previous_status"] = old_status
+    event_name = {"online": "cctv.online", "offline": "cctv.offline"}.get(new_status, "cctv.status_changed")
+    await manager.send_to_control_room(build_event(event_name, payload))
+
+
+def _cctv_stream_summary(session: models.CCTVStreamSession, camera: models.CCTVCamera) -> dict:
+    return {
+        "session_id": str(session.id),
+        "camera_id": str(camera.id),
+        "camera_code": camera.camera_code,
+        "status": session.status.value if session.status else None,
+    }
+
+
+async def publish_cctv_stream_requested(session: models.CCTVStreamSession, camera: models.CCTVCamera):
+    await manager.send_to_control_room(build_event("cctv.stream_requested", _cctv_stream_summary(session, camera)))
+
+
+async def publish_cctv_stream_started(session: models.CCTVStreamSession, camera: models.CCTVCamera):
+    await manager.send_to_control_room(build_event("cctv.stream_started", _cctv_stream_summary(session, camera)))
+
+
+async def publish_cctv_stream_ended(session: models.CCTVStreamSession, camera: models.CCTVCamera):
+    await manager.send_to_control_room(build_event("cctv.stream_ended", _cctv_stream_summary(session, camera)))
+
+
+async def publish_cctv_stream_failed(session: models.CCTVStreamSession, camera: models.CCTVCamera, reason: Optional[str] = None):
+    payload = _cctv_stream_summary(session, camera)
+    if reason:
+        payload["reason"] = reason
+    await manager.send_to_control_room(build_event("cctv.stream_failed", payload))
+
+
+# ---------------------------------------------------------------------------
+# AP-based police presence / movement handoff. Routed exactly like
+# publish_constable_location_updated above -- control_room + the
+# constable's own station ONLY, never back to the constable themselves
+# (they already know their own position) and never to any other
+# constable. See app/services/presence.py for the business logic that
+# triggers these.
+# ---------------------------------------------------------------------------
+
+def _presence_summary(presence: models.PolicePresence, access_point: Optional[models.AccessPoint]) -> dict:
+    return {
+        "device_id": str(presence.device_id),
+        "constable_id": str(presence.constable_id),
+        "access_point_id": str(presence.current_access_point_id) if presence.current_access_point_id else None,
+        "access_point_code": access_point.code if access_point else None,
+        "zone": presence.current_zone,
+        "status": presence.status.value if presence.status else None,
+        "location_source": presence.location_source,
+    }
+
+
+async def publish_presence_connected(presence: models.PolicePresence, access_point: models.AccessPoint, station_id: Optional[uuid.UUID]):
+    await manager.send_to_control_room(build_event("presence.connected", _presence_summary(presence, access_point)))
+    await manager.send_to_station(station_id, build_event("presence.connected", _presence_summary(presence, access_point)))
+
+
+async def publish_presence_handoff(
+    presence: models.PolicePresence,
+    handoff: models.PresenceHandoff,
+    from_access_point: Optional[models.AccessPoint],
+    to_access_point: models.AccessPoint,
+    station_id: Optional[uuid.UUID],
+):
+    payload = _presence_summary(presence, to_access_point)
+    payload["previous_access_point_id"] = str(handoff.previous_access_point_id) if handoff.previous_access_point_id else None
+    payload["previous_access_point_code"] = from_access_point.code if from_access_point else None
+    payload["event_id"] = handoff.event_id
+    payload["source"] = handoff.source.value if handoff.source else None
+    event = build_event("presence.handoff", payload)
+    await manager.send_to_control_room(event)
+    await manager.send_to_station(station_id, event)
+
+
+async def publish_presence_status_changed(presence: models.PolicePresence, old_status: str, new_status: str, station_id: Optional[uuid.UUID]):
+    payload = _presence_summary(presence, None)
+    payload["previous_status"] = old_status
+    event_name = {"stale": "presence.stale", "disconnected": "presence.offline", "connected": "presence.online"}.get(new_status, "presence.status_changed")
+    event = build_event(event_name, payload)
+    await manager.send_to_control_room(event)
+    await manager.send_to_station(station_id, event)
+
+
+async def publish_presence_moving(
+    *,
+    device_id: uuid.UUID,
+    constable_id: uuid.UUID,
+    from_access_point_code: Optional[str],
+    target_access_point_code: str,
+    from_zone: Optional[str],
+    target_zone: Optional[str],
+    progress: int,
+    station_id: Optional[uuid.UUID],
+):
+    """
+    Pure WebSocket passthrough -- see routers/presence.py::moving_ping.
+    This function never touches MongoDB (no model backs this event);
+    "moving" is a transient UI state, not a persisted fact. Routed
+    exactly like every other presence event: control_room + the
+    constable's own station, never to the constable themselves or any
+    other constable.
+    """
+    payload = {
+        "device_id": str(device_id),
+        "constable_id": str(constable_id),
+        "from_access_point_code": from_access_point_code,
+        "target_access_point_code": target_access_point_code,
+        "from_zone": from_zone,
+        "target_zone": target_zone,
+        "progress": progress,
+        "source": models.PresenceEventSource.simulator.value,
+    }
+    event = build_event("presence.moving", payload)
+    await manager.send_to_control_room(event)
+    await manager.send_to_station(station_id, event)
+
+
+async def publish_zone_emergency_alert(
+    *, zone: str, message: str, targeted_constable_ids: list, station_id: Optional[uuid.UUID] = None
+):
+    """
+    Reuses the existing WebSocket transport (manager.send_to_constable)
+    rather than inventing a second notification channel -- see
+    routers/presence.py::alert_zone. Sent to control_room (situational
+    awareness of what was just sent) and individually to each targeted
+    constable's own room -- never to a constable NOT currently present in
+    this zone.
+    """
+    payload = {"zone": zone, "message": message, "targeted_count": len(targeted_constable_ids)}
+    await manager.send_to_control_room(build_event("zone.emergency_alert", payload))
+    for constable_id in targeted_constable_ids:
+        await manager.send_to_constable(constable_id, build_event("zone.emergency_alert", {"zone": zone, "message": message}))

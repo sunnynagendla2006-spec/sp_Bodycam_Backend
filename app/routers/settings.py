@@ -20,6 +20,12 @@ class SystemSettings(BaseModel):
     device_stale_seconds: int = 120
     device_offline_seconds: int = 600
     max_websocket_connections_per_room: int = 200
+    # AP-based presence: same stale/offline-after-N-seconds pattern as
+    # device_stale_seconds/device_offline_seconds above, applied to
+    # PolicePresence.last_seen_at instead of Device.last_seen_at -- see
+    # app/services/presence.py::compute_effective_presence_status.
+    presence_stale_seconds: int = 120
+    presence_offline_seconds: int = 600
 
 def load_settings():
     if os.path.exists(SETTINGS_FILE):
@@ -34,6 +40,8 @@ def load_settings():
         "device_stale_seconds": 120,
         "device_offline_seconds": 600,
         "max_websocket_connections_per_room": 200,
+        "presence_stale_seconds": 120,
+        "presence_offline_seconds": 600,
     }
 
 # These values (chunk size, geofence threshold, audio alert toggle) are
