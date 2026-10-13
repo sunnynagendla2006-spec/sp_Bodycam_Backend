@@ -49,28 +49,34 @@ from app.models import (
     User,
     UserRole,
     UserStatus,
+    EventZone,
+    ZoneType,
+    PresenceEventSource,
 )
 from app.auth.security import hash_password
+from app.services.presence import process_association
 
 DEPLOYMENT_NAME = "JATARA-DEMO-001"
 TEST_PASSWORD = "Demo@12345"  # matches seed_demo.py/seed_test_data.py's existing convention
 
 OFFICERS = [
-    {"phone": "9990003023", "badge": "POL-023", "device": "DEV-023"},
-    {"phone": "9990003024", "badge": "POL-024", "device": "DEV-024"},
-    {"phone": "9990003025", "badge": "POL-025", "device": "DEV-025"},
+    {"phone": "9990003023", "badge": "POL-023", "device": "DEV-023", "ap": "AP-01"},
+    {"phone": "9990003024", "badge": "POL-024", "device": "DEV-024", "ap": "AP-02"},
+    {"phone": "9990003025", "badge": "POL-025", "device": "DEV-025", "ap": "AP-03"},
+    {"phone": "9990003026", "badge": "POL-026", "device": "DEV-026", "ap": "AP-04"},
 ]
 
 ACCESS_POINTS = [
-    {"code": "AP-01", "name": "Main Gate", "zone": "ZONE-01", "longitude": 78.4500, "latitude": 17.4300},
-    {"code": "AP-02", "name": "Main Temple", "zone": "ZONE-02", "longitude": 78.4550, "latitude": 17.4330},
-    {"code": "AP-03", "name": "Parking Area", "zone": "ZONE-03", "longitude": 78.4480, "latitude": 17.4360},
-    {"code": "AP-04", "name": "Food / Market Area", "zone": "ZONE-04", "longitude": 78.4530, "latitude": 17.4345},
+    {"code": "AP-01", "name": "Main Gate", "zone": "ZONE-01", "zone_type": ZoneType.main_gate, "longitude": 78.4500, "latitude": 17.4300, "poly_offset": (-0.002, -0.002, 0.002, 0.002)},
+    {"code": "AP-02", "name": "Main Temple", "zone": "ZONE-02", "zone_type": ZoneType.temple, "longitude": 78.4550, "latitude": 17.4330, "poly_offset": (-0.002, -0.002, 0.002, 0.002)},
+    {"code": "AP-03", "name": "Parking Area", "zone": "ZONE-03", "zone_type": ZoneType.parking, "longitude": 78.4480, "latitude": 17.4360, "poly_offset": (-0.002, -0.002, 0.002, 0.002)},
+    {"code": "AP-04", "name": "Emergency Route / VIP", "zone": "ZONE-04", "zone_type": ZoneType.emergency_route, "longitude": 78.4520, "latitude": 17.4315, "poly_offset": (-0.002, -0.002, 0.002, 0.002)},
+    {"code": "AP-05", "name": "Food / Market Area", "zone": "ZONE-05", "zone_type": ZoneType.crowd_control, "longitude": 78.4530, "latitude": 17.4345, "poly_offset": (-0.002, -0.002, 0.002, 0.002)},
 ]
 
 
 async def seed():
-    from app.geo import point
+    from app.geo import point, polygon
 
     await init_db()
 
@@ -80,6 +86,7 @@ async def seed():
         await deployment.insert()
         print(f"created deployment: {DEPLOYMENT_NAME}")
 
+    ap_map = {}
     for ap_def in ACCESS_POINTS:
         existing = await AccessPoint.find_one(AccessPoint.code == ap_def["code"])
         new_location = point(ap_def["longitude"], ap_def["latitude"])
@@ -90,13 +97,40 @@ async def seed():
             )
             await ap.insert()
             print(f"created access point: {ap_def['code']} ({ap_def['name']}) -- {ap_def['zone']} -- {DEPLOYMENT_NAME}")
-        elif existing.zone != ap_def["zone"] or existing.name != ap_def["name"] or existing.deployment != DEPLOYMENT_NAME:
-            existing.zone = ap_def["zone"]
-            existing.name = ap_def["name"]
-            existing.deployment = DEPLOYMENT_NAME
-            existing.location = new_location
-            await existing.save()
-            print(f"updated access point: {ap_def['code']} -> {ap_def['zone']} ({ap_def['name']})")
+            ap_map[ap.code] = ap
+        else:
+            if existing.zone != ap_def["zone"] or existing.name != ap_def["name"] or existing.deployment != DEPLOYMENT_NAME:
+                existing.zone = ap_def["zone"]
+                existing.name = ap_def["name"]
+                existing.deployment = DEPLOYMENT_NAME
+                existing.location = new_location
+                await existing.save()
+                print(f"updated access point: {ap_def['code']} -> {ap_def['zone']} ({ap_def['name']})")
+            ap_map[existing.code] = existing
+
+        # Create or update corresponding EventZone
+        ez = await EventZone.find_one(EventZone.code == ap_def["zone"])
+        lon, lat = ap_def["longitude"], ap_def["latitude"]
+        d = 0.0015
+        poly_coords = [
+            [lon - d, lat - d],
+            [lon + d, lat - d],
+            [lon + d, lat + d],
+            [lon - d, lat + d],
+            [lon - d, lat - d],
+        ]
+        if not ez:
+            ez = EventZone(
+                name=f"{ap_def['name']} Zone",
+                code=ap_def["zone"],
+                zone_type=ap_def["zone_type"],
+                polygon=polygon([poly_coords]),
+                priority=10,
+                event_id="JATARA-2026-EVENT",
+                description=f"Operational coverage sector for {ap_def['name']}",
+            )
+            await ez.insert()
+            print(f"created event zone: {ez.code} ({ez.name})")
 
     hashed_pwd = hash_password(TEST_PASSWORD)
     for officer in OFFICERS:
@@ -116,18 +150,34 @@ async def seed():
         if not device:
             device = Device(
                 constable_id=constable.id, device_identifier=officer["device"],
-                platform="android", status=DeviceStatus.offline,
+                platform="android", status=DeviceStatus.online,
             )
             await device.insert()
             print(f"created device: {officer['device']} -> {officer['badge']}")
         elif device.constable_id != constable.id:
             device.constable_id = constable.id
+            device.status = DeviceStatus.online
             await device.save()
             print(f"updated device association: {officer['device']} -> {officer['badge']}")
 
-    print(f"\n{DEPLOYMENT_NAME} demo data seeded.")
-    print(f"Login: phone={OFFICERS[0]['phone']} password={TEST_PASSWORD} (and the other two officer phones, same password)")
-    print("Officers: " + ", ".join(f"{o['badge']}/{o['device']}" for o in OFFICERS))
+        # Ensure active presence association to designated AP
+        target_ap = ap_map.get(officer.get("ap"))
+        if target_ap:
+            try:
+                await process_association(
+                    device=device,
+                    constable=constable,
+                    access_point=target_ap,
+                    event_id=None,
+                    occurred_at=None,
+                    source=PresenceEventSource.simulator,
+                )
+                print(f"associated {officer['badge']} to {target_ap.code} ({target_ap.zone})")
+            except Exception as e:
+                print(f"association warning: {e}")
+
+    print(f"\n{DEPLOYMENT_NAME} demo data seeded with active presence.")
+    print(f"Officers: " + ", ".join(f"{o['badge']}/{o['device']} -> {o['ap']}" for o in OFFICERS))
     print("Access points: " + ", ".join(f"{a['code']} ({a['zone']})" for a in ACCESS_POINTS))
 
 

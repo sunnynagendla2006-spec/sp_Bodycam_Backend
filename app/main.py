@@ -18,8 +18,15 @@ from fastapi.middleware.cors import CORSMiddleware
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     from .database import init_db
+    from .models import AccessPoint
 
     await init_db()
+    if await AccessPoint.count() == 0:
+        try:
+            from scripts.seed_ap_presence_demo import seed as seed_demo_aps
+            await seed_demo_aps()
+        except Exception:
+            pass
     yield
 
 
