@@ -1,8 +1,9 @@
+import enum
 from pydantic import BaseModel, ConfigDict, Field
 from typing import Optional, List
 import uuid
 from datetime import datetime
-from .models import UserRole, UserStatus, ConstableStatus, IncidentStatus, MediaType, UploadStatus, AssignmentStatus, DeviceStatus, AlertType, AlertSeverity, AlertStatus, RecordingTriggerType, RecordingStatus, RemoteCommandType, RemoteCommandStatus, LiveStreamStatus, LiveStreamStartedBy, CCTVProviderType, CCTVStreamProtocol, CCTVCameraStatus, CCTVStreamSessionStatus, CCTVCapabilities, AccessPointStatus, PresenceConnectionStatus, PresenceEventSource, DeploymentStatus
+from .models import UserRole, UserStatus, ConstableStatus, IncidentStatus, MediaType, UploadStatus, AssignmentStatus, DeviceStatus, AlertType, AlertSeverity, AlertStatus, RecordingTriggerType, RecordingStatus, RemoteCommandType, RemoteCommandStatus, LiveStreamStatus, LiveStreamStartedBy, CCTVProviderType, CCTVStreamProtocol, CCTVCameraStatus, CCTVStreamSessionStatus, CCTVCapabilities, AccessPointStatus, PresenceConnectionStatus, PresenceEventSource, DeploymentStatus, ZoneType
 
 class UserBase(BaseModel):
     phone: str
@@ -267,10 +268,14 @@ class ConstableMeLocationUpdate(BaseModel):
     """Body for POST /constables/me/location -- deliberately distinct from
     the legacy ConstableLocationUpdate (location_lon/location_lat) used by
     the existing admin-facing POST /constables/{id}/location, matching the
-    field names the Flutter app will actually send."""
+    canonical contract in Task 4."""
     latitude: float = Field(..., ge=-90.0, le=90.0)
     longitude: float = Field(..., ge=-180.0, le=180.0)
     accuracy: Optional[float] = Field(default=None, ge=0.0)
+    recorded_at: Optional[datetime] = None
+    sequence_number: Optional[int] = None
+    deployment: Optional[str] = None
+    source: Optional[str] = "GNSS"
 
 class ConstableLocationResponse(BaseModel):
     status: str
@@ -279,6 +284,12 @@ class ConstableLocationResponse(BaseModel):
     longitude: float
     accuracy: Optional[float] = None
     timestamp: datetime
+    recorded_at: Optional[datetime] = None
+    server_received_at: Optional[datetime] = None
+    sequence_number: Optional[int] = None
+    geographic_zone: Optional[str] = None
+    zone_status: Optional[str] = None
+    source: Optional[str] = "GNSS"
 
 class ConstableStatusUpdateRequest(BaseModel):
     status: str  # validated against a restricted allow-list in the router, not the full AssignmentStatus/IncidentStatus enum
@@ -901,3 +912,95 @@ class ZoneAlertResponse(BaseModel):
     message: str
     targeted_constable_ids: List[uuid.UUID]
     targeted_device_count: int
+
+
+# ---------------------------------------------------------------------------
+# Geographic Event Zones (Task 1)
+# ---------------------------------------------------------------------------
+
+class EventZoneCreateRequest(BaseModel):
+    code: str = Field(..., min_length=2, max_length=64)
+    name: str = Field(..., min_length=2, max_length=255)
+    description: Optional[str] = None
+    deployment: Optional[str] = None
+    zone_type: ZoneType = ZoneType.security
+    # coordinates must be a GeoJSON polygon ring list: [[[lon, lat], ...]]
+    coordinates: List[List[List[float]]]
+    priority: int = 0
+    color: Optional[str] = "#3B82F6"
+    enabled: bool = True
+
+
+class EventZoneUpdateRequest(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=2, max_length=255)
+    description: Optional[str] = None
+    deployment: Optional[str] = None
+    zone_type: Optional[ZoneType] = None
+    coordinates: Optional[List[List[List[float]]]] = None
+    priority: Optional[int] = None
+    color: Optional[str] = None
+    enabled: Optional[bool] = None
+
+
+class EventZoneResponse(BaseModel):
+    id: uuid.UUID
+    code: str
+    name: str
+    description: Optional[str] = None
+    deployment: Optional[str] = None
+    zone_type: ZoneType
+    coordinates: List[List[List[float]]]
+    priority: int
+    color: Optional[str] = None
+    enabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Physical Edge AP Telemetry Ingestion (Task 2)
+# ---------------------------------------------------------------------------
+
+class EdgeAPEventType(str, enum.Enum):
+    association = "association"
+    disassociation = "disassociation"
+    roam = "roam"
+
+
+class EdgeAPTelemetryEventRequest(BaseModel):
+    controller_event_id: str = Field(..., min_length=1, max_length=128)
+    controller_id: str = Field(..., min_length=1, max_length=64)
+    ap_code: Optional[str] = None
+    ap_bssid: Optional[str] = None
+    event_type: EdgeAPEventType = EdgeAPEventType.association
+    occurred_at: datetime
+    device_identifier: Optional[str] = None
+    authenticated_identity: Optional[str] = None
+    station_mac: Optional[str] = None
+    ssid: Optional[str] = None
+    rssi_dbm: Optional[int] = None
+    source_metadata: Optional[dict] = None
+
+
+class EdgeAPTelemetryBatchRequest(BaseModel):
+    events: List[EdgeAPTelemetryEventRequest] = Field(..., min_length=1, max_length=50)
+
+
+class EdgeAPTelemetryResponse(BaseModel):
+    status: str  # "accepted", "duplicate_ignored", "unmapped_device", "disassociated"
+    event_id: str
+    processed_at: datetime
+    handoff_created: bool = False
+    device_identifier: Optional[str] = None
+    access_point_code: Optional[str] = None
+    message: Optional[str] = None
+
+
+class EdgeAPTelemetryBatchResponse(BaseModel):
+    total: int
+    accepted: int
+    duplicate: int
+    unmapped: int
+    errors: int
+    results: List[EdgeAPTelemetryResponse]
+

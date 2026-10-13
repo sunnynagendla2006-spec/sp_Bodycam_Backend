@@ -109,3 +109,54 @@ def require_role(*allowed_roles: str):
         return user
 
     return dependency
+
+
+# ===========================================================================
+# Physical Edge Controller Authentication (Task 2)
+# ===========================================================================
+
+import os
+import secrets
+from fastapi import Header
+
+EDGE_CONTROLLER_API_KEY = os.getenv("EDGE_CONTROLLER_API_KEY", "edge-controller-dev-key").strip()
+
+
+async def get_current_edge_controller(
+    x_edge_controller_key: str = Header(default="", alias="X-Edge-Controller-Key"),
+    x_edge_controller_id: str = Header(default="", alias="X-Edge-Controller-Id"),
+    authorization: str = Header(default="", alias="Authorization"),
+) -> dict:
+    """
+    Dedicated edge controller authentication -- MUST NEVER reuse constable JWTs.
+    Requires matching X-Edge-Controller-Key or dedicated Edge Bearer token.
+    Uses constant-time comparison to prevent timing side-channels.
+    """
+    candidate_key = x_edge_controller_key.strip()
+    if not candidate_key and authorization:
+        parts = authorization.strip().split()
+        if len(parts) == 2 and parts[0].lower() in ("bearer", "edgekey"):
+            candidate_key = parts[1]
+
+    if not candidate_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing edge controller credentials (X-Edge-Controller-Key required)",
+            headers={"WWW-Authenticate": "EdgeKey"},
+        )
+
+    # Constant-time comparison
+    if not secrets.compare_digest(candidate_key, EDGE_CONTROLLER_API_KEY):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid edge controller credentials",
+            headers={"WWW-Authenticate": "EdgeKey"},
+        )
+
+    controller_id = x_edge_controller_id.strip() or "edge-collector-default"
+    return {
+        "controller_id": controller_id,
+        "authenticated": True,
+        "source": models.PresenceEventSource.controller.value,
+    }
+

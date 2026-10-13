@@ -59,7 +59,15 @@ from pymongo.errors import PyMongoError
 from app import models
 from app.auth.security import hash_password
 
-TEST_MONGODB_URL = os.getenv("TEST_MONGODB_URL", "mongodb://localhost:27017/?replicaSet=rs0")
+_DEFAULT_TEST_MONGO = os.getenv("TEST_MONGODB_URL")
+if not _DEFAULT_TEST_MONGO:
+    try:
+        MongoClient("mongodb://localhost:27017/?replicaSet=rs0", serverSelectionTimeoutMS=200, uuidRepresentation="standard").admin.command("ping")
+        TEST_MONGODB_URL = "mongodb://localhost:27017/?replicaSet=rs0"
+    except PyMongoError:
+        TEST_MONGODB_URL = "mongodb://localhost:27017"
+else:
+    TEST_MONGODB_URL = _DEFAULT_TEST_MONGO
 
 
 def _mongo_reachable() -> bool:
@@ -201,6 +209,8 @@ async def full_client(mongo_db):
     from app.routers import recordings as recordings_router_module
     from app.routers import settings as settings_router_module
     from app.routers import websocket as websocket_router_module
+    from app.routers import event_zones as event_zones_router_module
+    from app.routers import ap_telemetry as ap_telemetry_router_module
 
     tmp_upload_dir = tempfile.mkdtemp(prefix="sp_test_uploads_")
     media_router_module.UPLOAD_DIR = tmp_upload_dir
@@ -223,6 +233,9 @@ async def full_client(mongo_db):
     app.include_router(access_points_router_module.router)
     app.include_router(presence_router_module.router)
     app.include_router(deployments_router_module.router)
+    app.include_router(event_zones_router_module.router)
+    app.include_router(ap_telemetry_router_module.router)
+
 
     transport = ASGIWebSocketTransport(app=app)
     async with _asgi_client(transport) as c:

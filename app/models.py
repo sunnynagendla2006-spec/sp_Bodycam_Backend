@@ -243,6 +243,12 @@ class Constable(Document):
     status: ConstableStatus = ConstableStatus.offline
     battery_level: Optional[int] = None
     last_login: Optional[datetime] = None
+    last_location_point: Optional[GeoPoint] = None
+    last_location_at: Optional[datetime] = None
+    last_location_accuracy: Optional[float] = None
+    last_location_sequence: Optional[int] = None
+    current_geographic_zone: Optional[str] = None
+    zone_status: Optional[str] = None
 
     class Settings:
         name = "constables"
@@ -267,6 +273,15 @@ class ConstableLocation(Document):
     location: GeoPoint
     accuracy: Optional[float] = None
     timestamp: datetime = Field(default_factory=_utcnow)
+    device_id: Optional[uuid.UUID] = None
+    sequence_number: Optional[int] = None
+    recorded_at: Optional[datetime] = None
+    server_received_at: datetime = Field(default_factory=_utcnow)
+    geographic_zone: Optional[str] = None
+    zone_status: Optional[str] = "CONFIRMED"
+    source: str = "GNSS"
+    deployment: Optional[str] = None
+    is_stale: bool = False
 
     class Settings:
         name = "constable_locations"
@@ -798,14 +813,12 @@ class PresenceConnectionStatus(str, enum.Enum):
 
 class PresenceEventSource(str, enum.Enum):
     """
-    Server-determined, NEVER accepted from a request body (see
-    routers/presence.py) -- distinguishes a genuine AP/edge-reported
-    association from a future development-only simulator path. Only
-    `real` is ever actually produced by any endpoint that exists today;
-    `simulator` is reserved for a not-yet-built dev-only endpoint.
+    Server-determined, NEVER accepted from a request body -- distinguishes a
+    genuine AP/edge-reported association from a simulator path.
     """
     real = "REAL"
     simulator = "SIMULATOR"
+    controller = "PHYSICAL_CONTROLLER"
 
 
 class AccessPoint(Document):
@@ -971,6 +984,76 @@ class Deployment(Document):
         ]
 
 
+class ZoneType(str, enum.Enum):
+    security = "SECURITY"
+    crowd_control = "CROWD_CONTROL"
+    parking = "PARKING"
+    temple = "TEMPLE"
+    main_gate = "MAIN_GATE"
+    emergency_route = "EMERGENCY_ROUTE"
+    perimeter = "PERIMETER"
+    other = "OTHER"
+
+
+class EventZone(Document):
+    """
+    Geographic operational zone defined by a GeoJSON polygon boundary in WGS84
+    [longitude, latitude] coordinates.
+    Deliberately distinct from coarse AccessPoint.zone (AP association):
+    this models the real physical geographic area of an event (e.g. Main Gate,
+    Temple Sanctum, Parking, Emergency Route).
+    """
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    code: str  # Unique natural key, e.g. "ZONE-MAIN-GATE"
+    name: str  # Display name, e.g. "Main Entrance & Security Checkpoint"
+    description: Optional[str] = None
+    deployment: Optional[str] = None  # Linkage to Deployment.name, e.g. "JATARA-DEMO-001"
+    zone_type: ZoneType = ZoneType.security
+    polygon: GeoPolygon  # Valid GeoJSON polygon with [lon, lat] coordinates
+    priority: int = 0  # Deterministic overlap resolution: higher priority wins
+    enabled: bool = True
+    color: Optional[str] = "#3B82F6"  # Optional hex color for UI map rendering
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+    created_by: Optional[uuid.UUID] = None
+    updated_by: Optional[uuid.UUID] = None
+
+    class Settings:
+        name = "event_zones"
+        indexes = [
+            IndexModel([("code", ASCENDING)], unique=True),
+            IndexModel([("deployment", ASCENDING)]),
+            IndexModel([("enabled", ASCENDING)]),
+            IndexModel([("priority", -1)]),
+            IndexModel([("polygon", "2dsphere")]),
+        ]
+
+
+class EdgeControllerEventLog(Document):
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    controller_event_id: str  # unique event ID from the physical AP controller/edge collector
+    controller_id: str  # identity of the authorized edge collector or controller
+    ap_code: Optional[str] = None
+    ap_bssid: Optional[str] = None
+    device_identifier: Optional[str] = None
+    station_mac: Optional[str] = None  # observed client MAC, correlation only (subject to Android MAC randomization)
+    authenticated_identity: Optional[str] = None  # 802.1X / captive portal username or badge
+    event_type: str  # association, disassociation, roam
+    occurred_at: datetime
+    server_received_at: datetime = Field(default_factory=_utcnow)
+    status: str  # accepted, duplicate_ignored, unmapped_device, disassociated, unmapped_ap
+    details: Optional[dict] = None
+
+    class Settings:
+        name = "edge_controller_events"
+        indexes = [
+            IndexModel([("controller_event_id", ASCENDING)], unique=True),
+            IndexModel([("controller_id", ASCENDING), ("server_received_at", -1)]),
+            IndexModel([("device_identifier", ASCENDING)]),
+            IndexModel([("server_received_at", -1)]),
+        ]
+
+
 DOCUMENT_MODELS = [
     User,
     PoliceStation,
@@ -991,4 +1074,7 @@ DOCUMENT_MODELS = [
     PolicePresence,
     PresenceHandoff,
     Deployment,
+    EventZone,
+    EdgeControllerEventLog,
 ]
+

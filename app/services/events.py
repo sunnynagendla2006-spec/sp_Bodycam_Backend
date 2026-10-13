@@ -23,6 +23,7 @@ WebSocket delivery problem can never raise up into the caller and can
 never affect whether the database transaction that triggered it commits.
 """
 import uuid
+from datetime import datetime
 from typing import Optional
 
 from .. import models
@@ -184,6 +185,13 @@ async def publish_constable_location_updated(
     latitude: float,
     longitude: float,
     accuracy: Optional[float],
+    device_id: Optional[uuid.UUID] = None,
+    recorded_at: Optional[datetime] = None,
+    server_received_at: Optional[datetime] = None,
+    sequence_number: Optional[int] = None,
+    geographic_zone: Optional[str] = None,
+    zone_status: Optional[str] = None,
+    source: str = "GNSS",
 ):
     """
     Goes to control_room + the constable's OWN station only -- never to any
@@ -195,10 +203,46 @@ async def publish_constable_location_updated(
         "latitude": latitude,
         "longitude": longitude,
         "accuracy": accuracy,
+        "device_id": str(device_id) if device_id else None,
+        "recorded_at": recorded_at.isoformat() if recorded_at else None,
+        "server_received_at": server_received_at.isoformat() if server_received_at else None,
+        "sequence_number": sequence_number,
+        "geographic_zone": geographic_zone,
+        "zone_status": zone_status,
+        "source": source,
     }
     event = build_event("constable.location_updated", payload)
     await manager.send_to_control_room(event)
     await manager.send_to_station(station_id, event)
+
+
+async def publish_constable_zone_changed(
+    constable_id: uuid.UUID,
+    station_id: Optional[uuid.UUID],
+    previous_zone: Optional[str],
+    current_zone: Optional[str],
+    latitude: float,
+    longitude: float,
+    timestamp: datetime,
+    zone_status: str = "CONFIRMED",
+):
+    """
+    Published when an officer's accepted geographic zone boundary transition occurs.
+    Sent to control_room and the constable's own station.
+    """
+    payload = {
+        "constable_id": str(constable_id),
+        "previous_zone": previous_zone,
+        "current_zone": current_zone,
+        "latitude": latitude,
+        "longitude": longitude,
+        "timestamp": timestamp.isoformat(),
+        "zone_status": zone_status,
+    }
+    event = build_event("constable.zone_changed", payload)
+    await manager.send_to_control_room(event)
+    await manager.send_to_station(station_id, event)
+
 
 
 # ---------------------------------------------------------------------------

@@ -12,7 +12,7 @@ from .. import geo, models, schemas
 from ..auth.deps import get_current_user, require_role
 from ..auth.security import hash_password
 from ..services.audit import log_action
-from ..services import events
+from ..services import events, zones
 
 router = APIRouter(prefix="/constables", tags=["Constables"])
 
@@ -342,27 +342,121 @@ async def update_my_location(
     Flutter-facing location endpoint: constable identity comes ENTIRELY
     from the JWT via _require_own_constable -- there is no constable_id in
     the request at all, so there is nothing to spoof. Uses the server
-    timestamp as the authoritative received time -- no client timestamp is
-    accepted here. Does NOT touch User.last_login (an authentication
-    concept, not a location concept).
+    timestamp as the authoritative received time while preserving device
+    recorded timestamp, monotonic sequence number, and accuracy metrics.
+    Detects geographic zones per WGS84 polygon boundaries, applies hysteresis
+    and accuracy gating, and publishes constable.zone_changed when transitions occur.
     """
     constable = await _require_own_constable(current_user)
+    server_received_at = datetime.datetime.now(datetime.timezone.utc)
 
+    # Validate recorded_at timestamp if present (allow max 5 min clock skew into future)
+    if payload.recorded_at:
+        rec_at = payload.recorded_at
+        if rec_at.tzinfo is None:
+            rec_at = rec_at.replace(tzinfo=datetime.timezone.utc)
+        if rec_at > server_received_at + datetime.timedelta(minutes=5):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Recorded timestamp cannot be in the future beyond clock skew allowance",
+            )
+
+    # Monotonic sequence check for out-of-order rejection/stale flagging
+    is_stale = False
+    if payload.sequence_number is not None:
+        if constable.last_location_sequence is not None and payload.sequence_number < constable.last_location_sequence:
+            is_stale = True
+
+    # Detect geographic zone from coordinates
+    detected_zone, zone_status, _zone_doc = await zones.detect_geographic_zone(
+        longitude=payload.longitude,
+        latitude=payload.latitude,
+        accuracy=payload.accuracy,
+        deployment=payload.deployment,
+        previous_zone=constable.current_geographic_zone,
+    )
+
+    # Check for geographic zone transition (only if fix is not an older out-of-order packet)
+    if not is_stale and detected_zone != constable.current_geographic_zone:
+        previous_zone = constable.current_geographic_zone
+        constable.current_geographic_zone = detected_zone
+        constable.zone_status = zone_status
+        await events.publish_constable_zone_changed(
+            constable_id=constable.id,
+            station_id=constable.station_id,
+            previous_zone=previous_zone,
+            current_zone=detected_zone,
+            latitude=payload.latitude,
+            longitude=payload.longitude,
+            timestamp=server_received_at,
+            zone_status=zone_status,
+        )
+        await log_action(
+            user_id=current_user.id,
+            action="constable.zone_changed",
+            details={
+                "constable_id": str(constable.id),
+                "previous_zone": previous_zone,
+                "current_zone": detected_zone,
+                "zone_status": zone_status,
+            },
+        )
+
+    # Update constable current projection if fresh
+    if not is_stale:
+        constable.last_location_point = geo.point(payload.longitude, payload.latitude)
+        constable.last_location_at = server_received_at
+        constable.last_location_accuracy = payload.accuracy
+        if payload.sequence_number is not None:
+            constable.last_location_sequence = payload.sequence_number
+        await constable.save()
+
+    # Find associated device if any
+    device = await models.Device.find_one(models.Device.constable_id == constable.id)
+
+    # Persist append-only time-series record
     new_location = models.ConstableLocation(
         constable_id=constable.id,
         location=geo.point(payload.longitude, payload.latitude),
         accuracy=payload.accuracy,
+        timestamp=server_received_at,
+        device_id=device.id if device else None,
+        sequence_number=payload.sequence_number,
+        recorded_at=payload.recorded_at,
+        server_received_at=server_received_at,
+        geographic_zone=detected_zone,
+        zone_status=zone_status,
+        source=payload.source or "GNSS",
+        deployment=payload.deployment,
+        is_stale=is_stale,
     )
     await new_location.insert()
 
     await log_action(
         user_id=current_user.id,
         action="constable.location_updated",
-        details={"constable_id": str(constable.id), "accuracy": payload.accuracy},
+        details={
+            "constable_id": str(constable.id),
+            "accuracy": payload.accuracy,
+            "geographic_zone": detected_zone,
+            "sequence_number": payload.sequence_number,
+            "is_stale": is_stale,
+        },
     )
 
     await events.publish_constable_location_updated(
-        constable.id, constable.station_id, payload.latitude, payload.longitude, payload.accuracy
+        constable_id=constable.id,
+        station_id=constable.station_id,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        accuracy=payload.accuracy,
+        device_id=device.id if device else None,
+        recorded_at=payload.recorded_at,
+        server_received_at=server_received_at,
+        sequence_number=payload.sequence_number,
+        geographic_zone=detected_zone,
+        zone_status=zone_status,
+        source=payload.source or "GNSS",
     )
 
     return schemas.ConstableLocationResponse(
@@ -371,7 +465,13 @@ async def update_my_location(
         latitude=payload.latitude,
         longitude=payload.longitude,
         accuracy=payload.accuracy,
-        timestamp=new_location.timestamp,
+        timestamp=server_received_at,
+        recorded_at=payload.recorded_at,
+        server_received_at=server_received_at,
+        sequence_number=payload.sequence_number,
+        geographic_zone=detected_zone,
+        zone_status=zone_status,
+        source=payload.source or "GNSS",
     )
 
 

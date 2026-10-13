@@ -1,5 +1,8 @@
 import os
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -53,7 +56,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from .routers import auth, incidents, constables, media, settings, websocket, police_stations, audit_logs, devices, recordings, commands, alerts, live_stream, cctv, access_points, presence, deployments
+from .routers import auth, incidents, constables, media, settings, websocket, police_stations, audit_logs, devices, recordings, commands, alerts, live_stream, cctv, access_points, presence, deployments, event_zones, ap_telemetry
 app.include_router(auth.router)
 app.include_router(incidents.router)
 app.include_router(constables.router)
@@ -70,6 +73,9 @@ app.include_router(live_stream.router)
 app.include_router(access_points.router)
 app.include_router(presence.router)
 app.include_router(deployments.router)
+app.include_router(event_zones.router)
+app.include_router(ap_telemetry.router)
+
 
 # Authorized CCTV monitoring is an optional subsystem (see
 # app/services/cctv_security.py::CCTV_ENABLED) -- disabling it removes the
