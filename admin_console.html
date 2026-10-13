@@ -193,14 +193,13 @@
       <h2>Sign in</h2>
       <p class="sub">Phone + password, against your own running backend.</p>
       <form class="inline" id="loginForm">
-        <div class="field"><label>Phone</label><input type="text" id="loginPhone" placeholder="9990001001" autocomplete="username"></div>
-        <div class="field"><label>Password</label><input type="password" id="loginPassword" placeholder="Demo@12345" autocomplete="current-password"></div>
+        <div class="field"><label>Phone</label><input type="text" id="loginPhone" placeholder="Phone number" autocomplete="username"></div>
+        <div class="field"><label>Password</label><input type="password" id="loginPassword" placeholder="Password" autocomplete="current-password"></div>
         <div class="err" id="loginErr"></div>
         <button class="btn primary" type="submit">Sign in</button>
       </form>
       <div class="field" style="margin-top:14px">
         <label>Quick sign-in &mdash; seeded demo accounts</label>
-        <div class="quicklogins" id="quickLogins"></div>
         <div class="hint" style="margin-top:6px">Run <code class="kbd">seed_demo.py</code> + <code class="kbd">scripts/seed_ap_presence_demo.py</code> first if these fail.</div>
       </div>
     </div>
@@ -414,30 +413,6 @@
   }
 
   // ---------- auth ----------
-  const DEMO_ACCOUNTS = [
-    {label:'admin', phone:'9990001001'},
-    {label:'control_room', phone:'9990001002'},
-    {label:'station', phone:'9990001003'},
-    {label:'constable', phone:'9990001004'},
-    {label:'citizen', phone:'9990001005'},
-    {label:'POL-023 (DEV-023)', phone:'9990003023'},
-    {label:'POL-024 (DEV-024)', phone:'9990003024'},
-    {label:'POL-025 (DEV-025)', phone:'9990003025'},
-  ];
-  const DEMO_PASSWORD = 'Demo@12345';
-
-  function renderQuickLogins(){
-    const wrap = $('#quickLogins');
-    wrap.innerHTML = '';
-    DEMO_ACCOUNTS.forEach(acc => {
-      const b = document.createElement('button');
-      b.className = 'btn small';
-      b.textContent = acc.label;
-      b.addEventListener('click', () => doLogin(acc.phone, DEMO_PASSWORD));
-      wrap.appendChild(b);
-    });
-  }
-
   async function doLogin(phone, password){
     $('#loginErr').textContent = '';
     try{
@@ -987,7 +962,6 @@
 
   // ---------- boot ----------
   (async function init(){
-    renderQuickLogins();
     checkBackend();
     setInterval(checkBackend, 15000);
     const ok = await restoreSession();

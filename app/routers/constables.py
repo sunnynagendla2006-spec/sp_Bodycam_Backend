@@ -6,13 +6,15 @@ from typing import Optional
 
 from beanie.operators import In
 from fastapi import APIRouter, Depends, HTTPException, status
+from pymongo.errors import DuplicateKeyError
 from pydantic import BaseModel
 
 from .. import geo, models, schemas
 from ..auth.deps import get_current_user, require_role
 from ..auth.security import hash_password
+from ..auth import request_limiter
 from ..services.audit import log_action
-from ..services import events, zones
+from ..services import events, location_ingest
 
 router = APIRouter(prefix="/constables", tags=["Constables"])
 
@@ -333,146 +335,233 @@ async def update_my_assignment_status(
     return schemas.AssignmentActionResponse(status="updated", assignment_id=assignment.id, assignment_status=assignment.status)
 
 
+def _location_rate_limit_per_minute() -> int:
+    try:
+        return max(1, int(os.getenv("LOCATION_RATE_LIMIT_PER_MINUTE", "120")))
+    except ValueError:
+        return 120
+
+
+def _ingest_http_error(exc: location_ingest.IngestError) -> HTTPException:
+    return HTTPException(status_code=exc.http_status, detail={"code": exc.code, "message": exc.message, "retryable": exc.retryable})
+
+
+def _location_response(constable, payload, outcome) -> schemas.ConstableLocationResponse:
+    return schemas.ConstableLocationResponse(
+        status="Location updated successfully" if outcome.result != "duplicate" else "Duplicate fix ignored",
+        result=outcome.result,
+        constable_id=constable.id,
+        duty_session_id=outcome.session.id,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        accuracy=payload.accuracy,
+        timestamp=outcome.recorded_at,
+        recorded_at=outcome.recorded_at,
+        server_received_at=outcome.server_received_at,
+        sequence_number=payload.sequence_number,
+        geographic_zone=outcome.zone_code,
+        zone_status=outcome.zone_status,
+        zone_changed=outcome.zone_changed,
+        projection_advanced=outcome.projection_advanced,
+        buffered=outcome.buffered,
+        source=payload.source,
+    )
+
+
 @router.post("/me/location", response_model=schemas.ConstableLocationResponse)
 async def update_my_location(
     payload: schemas.ConstableMeLocationUpdate,
     current_user: models.User = Depends(get_current_user),
 ):
     """
-    Flutter-facing location endpoint: constable identity comes ENTIRELY
-    from the JWT via _require_own_constable -- there is no constable_id in
-    the request at all, so there is nothing to spoof. Uses the server
-    timestamp as the authoritative received time while preserving device
-    recorded timestamp, monotonic sequence number, and accuracy metrics.
-    Detects geographic zones per WGS84 polygon boundaries, applies hysteresis
-    and accuracy gating, and publishes constable.zone_changed when transitions occur.
+    Officer location fix. Constable identity comes ENTIRELY from the JWT --
+    there is no constable_id in the request, so there is nothing to spoof.
+
+    Requires an active duty session on an approved, enrolled device and a
+    fully specified fix (coordinates, accuracy, recorded_at, sequence_number).
+    Idempotent per (duty session, sequence_number): a retry returns
+    `result: "duplicate"` with HTTP 200 and changes nothing, so the client may
+    safely drop the queued item. See services/location_ingest.py for the full
+    contract and docs/MOBILE_INTEGRATION_CONTRACT.md for client behaviour.
     """
     constable = await _require_own_constable(current_user)
-    server_received_at = datetime.datetime.now(datetime.timezone.utc)
+    if not request_limiter.allow(f"loc:{current_user.id}", _location_rate_limit_per_minute()):
+        raise HTTPException(status_code=429, detail={"code": "rate_limited", "message": "Too many location updates", "retryable": True})
+    try:
+        outcome = await location_ingest.ingest_fix(constable=constable, user=current_user, payload=payload)
+    except location_ingest.IngestError as exc:
+        raise _ingest_http_error(exc)
+    return _location_response(constable, payload, outcome)
 
-    # Validate recorded_at timestamp if present (allow max 5 min clock skew into future)
-    if payload.recorded_at:
-        rec_at = payload.recorded_at
-        if rec_at.tzinfo is None:
-            rec_at = rec_at.replace(tzinfo=datetime.timezone.utc)
-        if rec_at > server_received_at + datetime.timedelta(minutes=5):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Recorded timestamp cannot be in the future beyond clock skew allowance",
-            )
 
-    # Monotonic sequence check for out-of-order rejection/stale flagging
-    is_stale = False
-    if payload.sequence_number is not None:
-        if constable.last_location_sequence is not None and payload.sequence_number < constable.last_location_sequence:
-            is_stale = True
+@router.post("/me/location/batch", response_model=schemas.ConstableLocationBatchResponse)
+async def update_my_location_batch(
+    payload: schemas.ConstableLocationBatchRequest,
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Flush of fixes queued while the officer had no route to the server.
+    Each fix is judged independently (a bad one never blocks the rest) and
+    reported back so the client knows exactly which to drop and which to
+    retry (`rejected` + a code the client treats as non-retryable means
+    drop). Older fixes become history; they never move the live marker.
+    Limited to 100 fixes per call and rate-limited separately from the
+    single-fix endpoint, so bulk uploads cannot crowd out live updates.
+    """
+    constable = await _require_own_constable(current_user)
+    if not request_limiter.allow(f"locbatch:{current_user.id}", 20):
+        raise HTTPException(status_code=429, detail={"code": "rate_limited", "message": "Too many batch uploads", "retryable": True})
+    # Oldest first, so the projection advances through history in order.
+    ordered = sorted(payload.fixes, key=lambda f: (f.recorded_at if f.recorded_at.tzinfo else f.recorded_at.replace(tzinfo=datetime.timezone.utc), f.sequence_number))
+    results = []
+    accepted = duplicate = rejected = 0
+    for fix in ordered:
+        try:
+            outcome = await location_ingest.ingest_fix(constable=constable, user=current_user, payload=fix)
+        except location_ingest.IngestError as exc:
+            rejected += 1
+            results.append(schemas.ConstableLocationBatchItemResult(sequence_number=fix.sequence_number, result="rejected", code=exc.code, detail=exc.message))
+            continue
+        if outcome.result == "duplicate":
+            duplicate += 1
+        else:
+            accepted += 1
+        results.append(schemas.ConstableLocationBatchItemResult(sequence_number=fix.sequence_number, result=outcome.result))
+    return schemas.ConstableLocationBatchResponse(total=len(ordered), accepted=accepted, duplicate=duplicate, rejected=rejected, results=results)
 
-    # Detect geographic zone from coordinates
-    detected_zone, zone_status, _zone_doc = await zones.detect_geographic_zone(
-        longitude=payload.longitude,
-        latitude=payload.latitude,
-        accuracy=payload.accuracy,
-        deployment=payload.deployment,
-        previous_zone=constable.current_geographic_zone,
+
+# ---------------------------------------------------------------------------
+# Duty sessions: the explicit authorisation for location tracking.
+# ---------------------------------------------------------------------------
+
+def _session_response(session: models.DutySession) -> schemas.DutySessionResponse:
+    return schemas.DutySessionResponse(
+        id=session.id, constable_id=session.constable_id, device_identifier=session.device_identifier,
+        status=session.status.value, started_at=session.started_at, ended_at=session.ended_at,
+        end_reason=session.end_reason, assigned_zone_code=session.assigned_zone_code, fix_count=session.fix_count,
     )
 
-    # Check for geographic zone transition (only if fix is not an older out-of-order packet)
-    if not is_stale and detected_zone != constable.current_geographic_zone:
-        previous_zone = constable.current_geographic_zone
-        constable.current_geographic_zone = detected_zone
-        constable.zone_status = zone_status
-        await events.publish_constable_zone_changed(
-            constable_id=constable.id,
-            station_id=constable.station_id,
-            previous_zone=previous_zone,
-            current_zone=detected_zone,
-            latitude=payload.latitude,
-            longitude=payload.longitude,
-            timestamp=server_received_at,
-            zone_status=zone_status,
-        )
-        await log_action(
-            user_id=current_user.id,
-            action="constable.zone_changed",
-            details={
-                "constable_id": str(constable.id),
-                "previous_zone": previous_zone,
-                "current_zone": detected_zone,
-                "zone_status": zone_status,
-            },
-        )
 
-    # Update constable current projection if fresh
-    if not is_stale:
-        constable.last_location_point = geo.point(payload.longitude, payload.latitude)
-        constable.last_location_at = server_received_at
-        constable.last_location_accuracy = payload.accuracy
-        if payload.sequence_number is not None:
-            constable.last_location_sequence = payload.sequence_number
-        await constable.save()
-
-    # Find associated device if any
-    device = await models.Device.find_one(models.Device.constable_id == constable.id)
-
-    # Persist append-only time-series record
-    new_location = models.ConstableLocation(
-        constable_id=constable.id,
-        location=geo.point(payload.longitude, payload.latitude),
-        accuracy=payload.accuracy,
-        timestamp=server_received_at,
-        device_id=device.id if device else None,
-        sequence_number=payload.sequence_number,
-        recorded_at=payload.recorded_at,
-        server_received_at=server_received_at,
-        geographic_zone=detected_zone,
-        zone_status=zone_status,
-        source=payload.source or "GNSS",
-        deployment=payload.deployment,
-        is_stale=is_stale,
+async def end_duty_session(
+    session: models.DutySession, constable: models.Constable, *, reason: str, ended_by: Optional[uuid.UUID]
+) -> models.DutySession:
+    """Shared by officer stop, admin force-end and device revocation. Idempotent."""
+    if session.status == models.DutySessionStatus.ended:
+        return session
+    session.status = models.DutySessionStatus.ended
+    session.ended_at = datetime.datetime.now(datetime.timezone.utc)
+    session.end_reason = reason
+    session.ended_by = ended_by
+    await session.save()
+    await models.Constable.get_motor_collection().update_one(
+        {"_id": constable.id, "active_duty_session_id": session.id}, {"$set": {"active_duty_session_id": None}}
     )
-    await new_location.insert()
-
+    await events.publish_constable_duty_changed(constable.id, constable.station_id, False, session.id, reason)
     await log_action(
-        user_id=current_user.id,
-        action="constable.location_updated",
-        details={
-            "constable_id": str(constable.id),
-            "accuracy": payload.accuracy,
-            "geographic_zone": detected_zone,
-            "sequence_number": payload.sequence_number,
-            "is_stale": is_stale,
-        },
+        user_id=ended_by, action="duty.ended",
+        details={"constable_id": str(constable.id), "duty_session_id": str(session.id), "reason": reason},
     )
+    return session
 
-    await events.publish_constable_location_updated(
-        constable_id=constable.id,
-        station_id=constable.station_id,
-        latitude=payload.latitude,
-        longitude=payload.longitude,
-        accuracy=payload.accuracy,
-        device_id=device.id if device else None,
-        recorded_at=payload.recorded_at,
-        server_received_at=server_received_at,
-        sequence_number=payload.sequence_number,
-        geographic_zone=detected_zone,
-        zone_status=zone_status,
-        source=payload.source or "GNSS",
-    )
 
-    return schemas.ConstableLocationResponse(
-        status="Location updated successfully",
-        constable_id=constable.id,
-        latitude=payload.latitude,
-        longitude=payload.longitude,
-        accuracy=payload.accuracy,
-        timestamp=server_received_at,
-        recorded_at=payload.recorded_at,
-        server_received_at=server_received_at,
-        sequence_number=payload.sequence_number,
-        geographic_zone=detected_zone,
-        zone_status=zone_status,
-        source=payload.source or "GNSS",
+@router.get("/me/duty-session", response_model=schemas.DutyStatusResponse)
+async def get_my_duty_session(current_user: models.User = Depends(get_current_user)):
+    """The client may collect and send location ONLY while `tracking_enabled` is true."""
+    constable = await _require_own_constable(current_user)
+    session = await models.DutySession.find_one(
+        models.DutySession.constable_id == constable.id, models.DutySession.status == models.DutySessionStatus.active
     )
+    if session is None:
+        return schemas.DutyStatusResponse(on_duty=False, session=None, tracking_enabled=False)
+    device = await models.Device.get(session.device_id)
+    approved = device is not None and device.enrolment_status == models.EnrolmentStatus.approved
+    return schemas.DutyStatusResponse(on_duty=True, session=_session_response(session), tracking_enabled=approved)
+
+
+@router.post("/me/duty-session/start", response_model=schemas.DutyStatusResponse)
+async def start_my_duty_session(
+    payload: schemas.DutyStartRequest,
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Starts location-tracking authorisation for the calling officer on ONE of
+    their own approved devices. Idempotent for the same device; 409 if the
+    officer is already on duty on a different device. Starting duty does not
+    start any audio/video recording.
+    """
+    constable = await _require_own_constable(current_user)
+    device = await models.Device.find_one(models.Device.device_identifier == payload.device_identifier)
+    if device is None or device.constable_id != constable.id:
+        raise HTTPException(status_code=404, detail={"code": "device_not_enrolled", "message": "This device is not enrolled for your account"})
+    if device.enrolment_status != models.EnrolmentStatus.approved:
+        raise HTTPException(status_code=403, detail={"code": "device_not_approved", "message": f"Device enrolment is {device.enrolment_status.value}; an administrator must approve it before duty can start"})
+
+    existing = await models.DutySession.find_one(
+        models.DutySession.constable_id == constable.id, models.DutySession.status == models.DutySessionStatus.active
+    )
+    if existing is not None:
+        if existing.device_id == device.id:
+            return schemas.DutyStatusResponse(on_duty=True, session=_session_response(existing), tracking_enabled=True)
+        raise HTTPException(status_code=409, detail={"code": "already_on_duty_other_device", "message": "You are already on duty on another device; stop that duty session first"})
+
+    session = models.DutySession(
+        constable_id=constable.id, device_id=device.id, device_identifier=device.device_identifier,
+        assigned_zone_code=constable.assigned_zone_code,
+    )
+    try:
+        await session.insert()
+    except DuplicateKeyError:
+        existing = await models.DutySession.find_one(
+            models.DutySession.constable_id == constable.id, models.DutySession.status == models.DutySessionStatus.active
+        )
+        if existing is not None and existing.device_id == device.id:
+            return schemas.DutyStatusResponse(on_duty=True, session=_session_response(existing), tracking_enabled=True)
+        raise HTTPException(status_code=409, detail={"code": "already_on_duty_other_device", "message": "You are already on duty"})
+
+    # A new duty period starts with a clean zone state so the first fix is
+    # accepted immediately instead of being held against a stale zone.
+    await models.Constable.get_motor_collection().update_one(
+        {"_id": constable.id},
+        {"$set": {
+            "active_duty_session_id": session.id, "current_geographic_zone": None, "zone_status": None,
+            "zone_candidate": None, "zone_candidate_count": 0,
+        }},
+    )
+    await events.publish_constable_duty_changed(constable.id, constable.station_id, True, session.id)
+    await log_action(
+        user_id=current_user.id, action="duty.started",
+        details={"constable_id": str(constable.id), "duty_session_id": str(session.id), "device_identifier": device.device_identifier},
+    )
+    return schemas.DutyStatusResponse(on_duty=True, session=_session_response(session), tracking_enabled=True)
+
+
+@router.post("/me/duty-session/stop", response_model=schemas.DutyStatusResponse)
+async def stop_my_duty_session(current_user: models.User = Depends(get_current_user)):
+    """Ends tracking authorisation. Idempotent. Queued fixes recorded before this moment are still accepted for a short grace period."""
+    constable = await _require_own_constable(current_user)
+    session = await models.DutySession.find_one(
+        models.DutySession.constable_id == constable.id, models.DutySession.status == models.DutySessionStatus.active
+    )
+    if session is not None:
+        await end_duty_session(session, constable, reason="officer_stopped", ended_by=current_user.id)
+    return schemas.DutyStatusResponse(on_duty=False, session=None, tracking_enabled=False)
+
+
+@router.post("/{constable_id}/duty-session/end", response_model=schemas.DutyStatusResponse)
+async def force_end_duty_session(
+    constable_id: uuid.UUID,
+    current_user: models.User = Depends(require_role("admin")),
+):
+    """Administrative override: end an officer's duty (and therefore tracking). Audited."""
+    constable = await models.Constable.get(constable_id)
+    if constable is None:
+        raise HTTPException(status_code=404, detail="Constable not found")
+    session = await models.DutySession.find_one(
+        models.DutySession.constable_id == constable.id, models.DutySession.status == models.DutySessionStatus.active
+    )
+    if session is not None:
+        await end_duty_session(session, constable, reason="admin_ended", ended_by=current_user.id)
+    return schemas.DutyStatusResponse(on_duty=False, session=None, tracking_enabled=False)
 
 
 # ===========================================================================
@@ -486,54 +575,16 @@ async def update_location(
     current_user: models.User = Depends(get_current_user),
 ):
     """
-    Legacy/administrative location endpoint. Kept for backward
-    compatibility; Flutter should use POST /constables/me/location instead
-    so identity always comes from the JWT.
-
-    Critical ownership check: a constable may only update THEIR OWN
-    location -- the path's constable_id is only used to verify it matches
-    their own derived constable id, never trusted as proof of identity.
-    admin/control_room may submit an administrative override for any
-    constable.
+    RETIRED. This endpoint accepted a bare coordinate for any constable id
+    (including an administrative override), with no duty session, no
+    timestamp/sequence and no accuracy -- i.e. positions that could be
+    injected rather than genuinely reported. Positions now arrive only
+    through POST /constables/me/location (or /me/location/batch).
     """
-    target_constable = await models.Constable.get(constable_id)
-    if not target_constable:
-        raise HTTPException(status_code=404, detail="Constable not found")
-
-    role = current_user.role
-    if role == models.UserRole.constable:
-        own_constable = await get_own_constable(current_user)
-        if not own_constable or own_constable.id != constable_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Cannot update another constable's location",
-            )
-    elif role in (models.UserRole.admin, models.UserRole.control_room):
-        pass  # administrative override, explicitly role-gated
-    else:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to update constable location")
-
-    new_location = models.ConstableLocation(
-        constable_id=constable_id,
-        location=geo.point(location_data.location_lon, location_data.location_lat),
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="This endpoint has been retired. Report location with POST /constables/me/location during an active duty session.",
     )
-    await new_location.insert()
-
-    if location_data.battery_level is not None:
-        target_constable.battery_level = location_data.battery_level
-        await target_constable.save()
-
-    await log_action(
-        user_id=current_user.id,
-        action="constable.location_updated",
-        details={"constable_id": str(constable_id), "battery_level": location_data.battery_level, "via": "admin_endpoint"},
-    )
-
-    await events.publish_constable_location_updated(
-        constable_id, target_constable.station_id, location_data.location_lat, location_data.location_lon, None
-    )
-
-    return {"status": "Location updated successfully"}
 
 
 class ConstableCreate(BaseModel):
@@ -702,9 +753,11 @@ async def list_constable_locations(
     current_user: models.User = Depends(get_current_user),
 ):
     """
-    admin/control_room: every constable's latest location.
-    station: scoped to their own station's constables.
-    Any other role: 403.
+    Latest server-held position of every officer who is ON DUTY, with the
+    fix's own recorded_at so callers can judge freshness. Off-duty officers
+    are not listed (their positions are not exposed). Prefer
+    GET /tracking/officers, which adds tracking state and zones.
+    admin/control_room: all. station: own station only. Others: 403.
     """
     role = current_user.role
     if role == models.UserRole.station and not current_user.station_id:
@@ -712,31 +765,18 @@ async def list_constable_locations(
     if role not in (models.UserRole.admin, models.UserRole.control_room, models.UserRole.station):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to view constable locations")
 
-    # "Latest location per constable" via $sort + $group ($first) -- the
-    # Mongo equivalent of the old GROUP BY + MAX(timestamp) join-back.
-    pipeline = [
-        {"$sort": {"timestamp": -1}},
-        {"$group": {"_id": "$constable_id", "location": {"$first": "$location"}}},
-    ]
-    latest_by_constable = {}
-    async for doc in models.ConstableLocation.get_motor_collection().aggregate(pipeline):
-        latest_by_constable[doc["_id"]] = doc["location"]
-
+    query = {"active_duty_session_id": {"$ne": None}, "last_location_point": {"$ne": None}}
     if role == models.UserRole.station:
-        constables = await models.Constable.find(models.Constable.station_id == current_user.station_id).to_list()
-    else:
-        constables = await models.Constable.find_all().to_list()
-
+        query["station_id"] = current_user.station_id
     results = []
-    for c in constables:
-        loc = latest_by_constable.get(c.id)
-        if not loc:
-            continue
-        lon, lat = loc["coordinates"]
+    for c in await models.Constable.find(query).to_list():
+        lon, lat = c.last_location_point.coordinates
         results.append({
             "constable_id": c.badge_number,
             "lon": lon,
             "lat": lat,
+            "accuracy": c.last_location_accuracy,
+            "recorded_at": c.last_location_recorded_at.isoformat() if c.last_location_recorded_at else None,
             "battery_level": c.battery_level,
         })
     return results

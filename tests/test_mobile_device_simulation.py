@@ -29,7 +29,7 @@ def _auth(token):
     return {"Authorization": f"Bearer {token}"}
 
 
-async def test_full_mobile_device_lifecycle_end_to_end(full_client, make_constable, make_user, make_station, auth_header):
+async def test_full_mobile_device_lifecycle_end_to_end(full_client, make_constable, make_user, make_station, auth_header, fix):
     """
     The complete simulated body-camera flow, step by step, using real API
     calls exactly as a future Android app would.
@@ -53,6 +53,15 @@ async def test_full_mobile_device_lifecycle_end_to_end(full_client, make_constab
     device_id = reg_resp.json()["id"]
     assert reg_resp.json()["status"] == "online"
 
+    # --- Step 2b: a new device is only a REQUEST until an administrator approves it ---
+    assert reg_resp.json()["enrolment_status"] == "pending"
+    await make_user(phone="sim000001ad", password="pw", role=UserRole.admin)
+    admin_headers = _auth(await _login(full_client, "sim000001ad", "pw"))
+    approve = await full_client.post(f"/devices/{device_id}/enrolment/approve", headers=admin_headers)
+    assert approve.status_code == 200 and approve.json()["enrolment_status"] == "approved"
+    duty = await full_client.post("/constables/me/duty-session/start", json={"device_identifier": "sim-pixel-7"}, headers=device_headers)
+    assert duty.status_code == 200, duty.text
+
     # --- Step 3: heartbeat ---
     hb_resp = await full_client.post("/devices/heartbeat", json={"device_identifier": "sim-pixel-7", "battery_percent": 85}, headers=device_headers)
     assert hb_resp.status_code == 200
@@ -63,7 +72,7 @@ async def test_full_mobile_device_lifecycle_end_to_end(full_client, make_constab
     assert batt_resp.status_code == 200
 
     # --- Step 5: location report (reuses the existing constable-location endpoint) ---
-    loc_resp = await full_client.post("/constables/me/location", json={"latitude": 17.385, "longitude": 78.4867, "accuracy": 12.5}, headers=device_headers)
+    loc_resp = await full_client.post("/constables/me/location", json=fix(seq=1, lat=17.385, lon=78.4867, accuracy=12.5), headers=device_headers)
     assert loc_resp.status_code == 200
 
     # --- Step 6: start emergency recording (volume-button-triggered, per the real project) ---

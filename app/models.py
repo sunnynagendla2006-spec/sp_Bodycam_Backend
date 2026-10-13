@@ -1,4 +1,5 @@
 import enum
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -10,6 +11,15 @@ from pymongo import ASCENDING, IndexModel
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def location_retention_days() -> int:
+    """How long location history is kept (LOCATION_RETENTION_DAYS, default 30; 0 is treated as the default, never 'forever')."""
+    try:
+        days = int(os.getenv("LOCATION_RETENTION_DAYS", "30"))
+    except ValueError:
+        days = 30
+    return days if days > 0 else 30
 
 
 class UserRole(str, enum.Enum):
@@ -247,8 +257,24 @@ class Constable(Document):
     last_location_at: Optional[datetime] = None
     last_location_accuracy: Optional[float] = None
     last_location_sequence: Optional[int] = None
-    current_geographic_zone: Optional[str] = None
+    # Device-clock time of the fix the projection above reflects. Freshness
+    # (live/delayed/stale) is ALWAYS derived from this, never from
+    # last_location_at (server receipt), so an old buffered fix that is
+    # uploaded late can never look like a live position.
+    last_location_recorded_at: Optional[datetime] = None
+    current_geographic_zone: Optional[str] = None  # DETECTED zone (from coordinates)
     zone_status: Optional[str] = None
+    zone_changed_at: Optional[datetime] = None
+    # Hysteresis state: a differing zone must be observed on consecutive
+    # trusted fixes before it replaces current_geographic_zone.
+    zone_candidate: Optional[str] = None
+    zone_candidate_count: int = 0
+    # ASSIGNED duty zone (EventZone.code) -- administrative intent, stored
+    # separately from the detected zone above.
+    assigned_zone_code: Optional[str] = None
+    assigned_zone_updated_at: Optional[datetime] = None
+    assigned_zone_updated_by: Optional[uuid.UUID] = None
+    active_duty_session_id: Optional[uuid.UUID] = None
 
     class Settings:
         name = "constables"
@@ -282,6 +308,13 @@ class ConstableLocation(Document):
     source: str = "GNSS"
     deployment: Optional[str] = None
     is_stale: bool = False
+    duty_session_id: Optional[uuid.UUID] = None
+    # True when the fix reached the server long after it was recorded
+    # (queued while offline). Buffered fixes are history, never "live".
+    buffered: bool = False
+    # False when this fix was older than the position projection already
+    # held (out-of-order arrival) and therefore did not move the marker.
+    advanced_projection: bool = True
 
     class Settings:
         name = "constable_locations"
@@ -410,6 +443,12 @@ class AuditLog(Document):
         ]
 
 
+class EnrolmentStatus(str, enum.Enum):
+    pending = "pending"
+    approved = "approved"
+    revoked = "revoked"
+
+
 class Device(Document):
     id: uuid.UUID = Field(default_factory=uuid.uuid4)
     constable_id: Optional[uuid.UUID] = None
@@ -420,6 +459,14 @@ class Device(Document):
     status: DeviceStatus = DeviceStatus.offline
     last_heartbeat_at: Optional[datetime] = None
     last_seen_at: Optional[datetime] = None
+    # Enrolment approval. Documents written before this field existed load
+    # as `approved` (they were already in service); new self-registrations
+    # are stored as `pending` by routers/devices.py unless
+    # DEVICE_AUTO_APPROVE is explicitly enabled. Only an `approved` device
+    # may start a duty session / submit tracked locations.
+    enrolment_status: EnrolmentStatus = EnrolmentStatus.approved
+    enrolment_reviewed_by: Optional[uuid.UUID] = None
+    enrolment_reviewed_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 
@@ -801,8 +848,42 @@ class CCTVStreamSession(Document):
 # ===========================================================================
 
 class AccessPointStatus(str, enum.Enum):
+    """
+    LEGACY stored value. Only a verified integration may ever make this
+    `online`/`offline`; a freshly registered AP is `unknown`. API responses
+    expose the derived `reachability` instead (see routers/access_points.py).
+    """
     online = "online"
     offline = "offline"
+    unknown = "unknown"
+
+
+class APVerificationStatus(str, enum.Enum):
+    registered = "registered"  # inventory row only; nothing configured to check
+    configured = "configured"  # identifiers (BSSID etc.) recorded, NOT verified
+    verified = "verified"  # confirmed by a real controller/API or authorised telemetry
+    verification_failed = "verification_failed"  # last attempt against a configured integration failed
+
+
+class APLifecycleStatus(str, enum.Enum):
+    active = "active"
+    disabled = "disabled"  # reversible administrative hold
+    retired = "retired"  # decommissioned; terminal, history retained
+
+
+class APIntegrationHealth(str, enum.Enum):
+    unconfigured = "unconfigured"  # no controller integration available for this AP
+    unknown = "unknown"  # configured but never checked
+    healthy = "healthy"
+    degraded = "degraded"
+    error = "error"
+
+
+class APConfigChange(BaseModel):
+    at: datetime = Field(default_factory=_utcnow)
+    by: Optional[uuid.UUID] = None
+    action: str  # created / updated / enabled / disabled / retired / verified / ...
+    changes: dict = Field(default_factory=dict)  # {field: {"from": x, "to": y}} -- never secrets
 
 
 class PresenceConnectionStatus(str, enum.Enum):
@@ -837,8 +918,32 @@ class AccessPoint(Document):
     # model doesn't need another migration the day a real AP is added --
     # see docs/VIRTUAL_AP_POLICE_PRESENCE.md's "virtual -> physical" plan.
     edge_node_id: Optional[str] = None
-    enabled: bool = True
-    status: AccessPointStatus = AccessPointStatus.online
+    # --- Real-world inventory ------------------------------------------------
+    manufacturer: Optional[str] = None
+    model: Optional[str] = None
+    serial_number: Optional[str] = None
+    bssid: Optional[str] = None  # normalised aa:bb:cc:dd:ee:ff (lower-case)
+    ssid: Optional[str] = None
+    management_ip: Optional[str] = None
+    controller_source: Optional[str] = None  # which controller/NMS this AP is managed from
+    building: Optional[str] = None
+    floor: Optional[str] = None
+    event_zone_codes: List[str] = Field(default_factory=list)  # EventZone.code values this AP serves
+    # --- Lifecycle / verification / telemetry (never inferred from admin edits)
+    enabled: bool = True  # kept in sync with lifecycle_status == active
+    lifecycle_status: APLifecycleStatus = APLifecycleStatus.active
+    status: AccessPointStatus = AccessPointStatus.unknown
+    verification_status: APVerificationStatus = APVerificationStatus.registered
+    verification_source: Optional[str] = None  # CONTROLLER_API / EDGE_TELEMETRY
+    verified_at: Optional[datetime] = None
+    last_verification_attempt_at: Optional[datetime] = None
+    last_verification_error: Optional[str] = None
+    last_seen_at: Optional[datetime] = None  # last REAL telemetry/controller report
+    integration_health: APIntegrationHealth = APIntegrationHealth.unconfigured
+    integration_checked_at: Optional[datetime] = None
+    retired_at: Optional[datetime] = None
+    retire_reason: Optional[str] = None
+    config_history: List[APConfigChange] = Field(default_factory=list)
     is_demo: bool = False
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
@@ -849,6 +954,14 @@ class AccessPoint(Document):
         name = "access_points"
         indexes = [
             IndexModel([("code", ASCENDING)], unique=True),
+            IndexModel([("bssid", ASCENDING)], unique=True, partialFilterExpression={"bssid": {"$type": "string"}}),
+            IndexModel(
+                [("manufacturer", ASCENDING), ("serial_number", ASCENDING)],
+                unique=True,
+                partialFilterExpression={"serial_number": {"$type": "string"}},
+            ),
+            IndexModel([("lifecycle_status", ASCENDING)]),
+            IndexModel([("verification_status", ASCENDING)]),
             IndexModel([("station_id", ASCENDING)]),
             IndexModel([("deployment", ASCENDING)]),
             IndexModel([("zone", ASCENDING)]),
@@ -874,6 +987,9 @@ class PolicePresence(Document):
     status: PresenceConnectionStatus = PresenceConnectionStatus.disconnected
     location_source: str = "ACCESS_POINT"
     last_event_id: Optional[str] = None
+    # Who reported this association: PHYSICAL_CONTROLLER (real network
+    # telemetry), REAL (the device's own claim) or SIMULATOR (demo only).
+    source: Optional[PresenceEventSource] = None
     last_seen_at: Optional[datetime] = None
     handoff_count: int = 0
     current_zone_since: Optional[datetime] = None
@@ -1029,6 +1145,67 @@ class EventZone(Document):
         ]
 
 
+class DutySessionStatus(str, enum.Enum):
+    active = "active"
+    ended = "ended"
+
+
+class DutySession(Document):
+    """
+    An explicitly started, officer-authorised period during which location
+    tracking is permitted. Location fixes are only accepted for an active
+    session (or for a fix recorded while a now-ended session was active, so
+    a queue flushed just after "stop" is not lost). A partial unique index
+    enforces at most ONE active session per constable at the database level.
+    """
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    constable_id: uuid.UUID
+    device_id: uuid.UUID
+    device_identifier: str
+    status: DutySessionStatus = DutySessionStatus.active
+    started_at: datetime = Field(default_factory=_utcnow)
+    ended_at: Optional[datetime] = None
+    end_reason: Optional[str] = None  # officer_stopped / admin_ended / device_revoked
+    ended_by: Optional[uuid.UUID] = None
+    assigned_zone_code: Optional[str] = None  # snapshot of the duty zone at start
+    fix_count: int = 0
+
+    class Settings:
+        name = "duty_sessions"
+        indexes = [
+            IndexModel(
+                [("constable_id", ASCENDING)],
+                unique=True,
+                partialFilterExpression={"status": "active"},
+                name="uq_one_active_duty_session_per_constable",
+            ),
+            IndexModel([("constable_id", ASCENDING), ("started_at", -1)]),
+            IndexModel([("status", ASCENDING)]),
+        ]
+
+
+class LocationIngestKey(Document):
+    """
+    Idempotency ledger for location ingestion: ConstableLocation is a
+    time-series collection (no unique indexes allowed), so duplicate
+    prevention lives here. The (duty_session_id, sequence_number) unique
+    index is what makes a retried/replayed fix a no-op even under a race.
+    Rows expire with the location-retention window.
+    """
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    duty_session_id: uuid.UUID
+    sequence_number: int
+    constable_id: uuid.UUID
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "location_ingest_keys"
+        indexes = [
+            IndexModel([("duty_session_id", ASCENDING), ("sequence_number", ASCENDING)], unique=True),
+            IndexModel([("created_at", ASCENDING)], expireAfterSeconds=location_retention_days() * 86400),
+        ]
+
+
 class EdgeControllerEventLog(Document):
     id: uuid.UUID = Field(default_factory=uuid.uuid4)
     controller_event_id: str  # unique event ID from the physical AP controller/edge collector
@@ -1076,5 +1253,7 @@ DOCUMENT_MODELS = [
     Deployment,
     EventZone,
     EdgeControllerEventLog,
+    DutySession,
+    LocationIngestKey,
 ]
 

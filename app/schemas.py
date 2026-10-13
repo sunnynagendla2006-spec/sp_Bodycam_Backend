@@ -1,9 +1,11 @@
 import enum
-from pydantic import BaseModel, ConfigDict, Field
-from typing import Optional, List
+import ipaddress
+import re
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from typing import Optional, List, Literal
 import uuid
 from datetime import datetime
-from .models import UserRole, UserStatus, ConstableStatus, IncidentStatus, MediaType, UploadStatus, AssignmentStatus, DeviceStatus, AlertType, AlertSeverity, AlertStatus, RecordingTriggerType, RecordingStatus, RemoteCommandType, RemoteCommandStatus, LiveStreamStatus, LiveStreamStartedBy, CCTVProviderType, CCTVStreamProtocol, CCTVCameraStatus, CCTVStreamSessionStatus, CCTVCapabilities, AccessPointStatus, PresenceConnectionStatus, PresenceEventSource, DeploymentStatus, ZoneType
+from .models import UserRole, UserStatus, ConstableStatus, IncidentStatus, MediaType, UploadStatus, AssignmentStatus, DeviceStatus, AlertType, AlertSeverity, AlertStatus, RecordingTriggerType, RecordingStatus, RemoteCommandType, RemoteCommandStatus, LiveStreamStatus, LiveStreamStartedBy, CCTVProviderType, CCTVStreamProtocol, CCTVCameraStatus, CCTVStreamSessionStatus, CCTVCapabilities, AccessPointStatus, APVerificationStatus, APLifecycleStatus, APIntegrationHealth, EnrolmentStatus, PresenceConnectionStatus, PresenceEventSource, DeploymentStatus, ZoneType
 
 class UserBase(BaseModel):
     phone: str
@@ -265,21 +267,41 @@ class ConstableMeResponse(BaseModel):
     is_active: bool
 
 class ConstableMeLocationUpdate(BaseModel):
-    """Body for POST /constables/me/location -- deliberately distinct from
-    the legacy ConstableLocationUpdate (location_lon/location_lat) used by
-    the existing admin-facing POST /constables/{id}/location, matching the
-    canonical contract in Task 4."""
+    """
+    Body for POST /constables/me/location (and each item of the batch
+    endpoint). Every field the server needs to trust, order and de-duplicate
+    a fix is REQUIRED: genuine coordinates, the device-reported accuracy,
+    the device-clock time the fix was taken, and a per-duty-session sequence
+    number. The constable identity is never in the body -- it comes from the JWT.
+    """
     latitude: float = Field(..., ge=-90.0, le=90.0)
     longitude: float = Field(..., ge=-180.0, le=180.0)
-    accuracy: Optional[float] = Field(default=None, ge=0.0)
-    recorded_at: Optional[datetime] = None
-    sequence_number: Optional[int] = None
-    deployment: Optional[str] = None
-    source: Optional[str] = "GNSS"
+    accuracy: float = Field(..., ge=0.0, le=10000.0)  # horizontal accuracy radius, meters
+    recorded_at: datetime
+    sequence_number: int = Field(..., ge=0)
+    duty_session_id: Optional[uuid.UUID] = None  # defaults to the officer's active session
+    device_identifier: Optional[str] = Field(default=None, max_length=128)
+    battery_level: Optional[int] = Field(default=None, ge=0, le=100)
+    network_type: Optional[Literal["WIFI", "CELLULAR", "ETHERNET", "OFFLINE", "UNKNOWN"]] = None
+    source: Literal["GNSS", "FUSED", "NETWORK", "CELL"] = "GNSS"
+    # Android Location.isMock()/isFromMockProvider(): a mocked fix is never genuine.
+    is_mock_provider: Optional[bool] = None
+    deployment: Optional[str] = Field(default=None, max_length=128)
+
+
+class ConstableLocationBatchRequest(BaseModel):
+    """Queued fixes flushed after a connectivity gap. Order inside the batch does not matter; each item is judged on its own recorded_at/sequence."""
+    fixes: List[ConstableMeLocationUpdate] = Field(..., min_length=1, max_length=100)
+
 
 class ConstableLocationResponse(BaseModel):
     status: str
+    # accepted        -> stored and moved the officer's position
+    # accepted_history-> stored as history only (older than the position already held)
+    # duplicate       -> this (duty session, sequence) was already ingested; nothing changed
+    result: str = "accepted"
     constable_id: uuid.UUID
+    duty_session_id: Optional[uuid.UUID] = None
     latitude: float
     longitude: float
     accuracy: Optional[float] = None
@@ -289,7 +311,128 @@ class ConstableLocationResponse(BaseModel):
     sequence_number: Optional[int] = None
     geographic_zone: Optional[str] = None
     zone_status: Optional[str] = None
+    zone_changed: bool = False
+    projection_advanced: bool = False
+    buffered: bool = False
     source: Optional[str] = "GNSS"
+
+
+class ConstableLocationBatchItemResult(BaseModel):
+    sequence_number: int
+    result: str  # accepted | accepted_history | duplicate | rejected
+    code: Optional[str] = None  # machine-readable reason when rejected
+    detail: Optional[str] = None
+
+
+class ConstableLocationBatchResponse(BaseModel):
+    total: int
+    accepted: int
+    duplicate: int
+    rejected: int
+    results: List[ConstableLocationBatchItemResult]
+
+
+class DutyStartRequest(BaseModel):
+    device_identifier: str = Field(..., min_length=1, max_length=128)
+
+
+class DutySessionResponse(BaseModel):
+    id: uuid.UUID
+    constable_id: uuid.UUID
+    device_identifier: str
+    status: str
+    started_at: datetime
+    ended_at: Optional[datetime] = None
+    end_reason: Optional[str] = None
+    assigned_zone_code: Optional[str] = None
+    fix_count: int = 0
+
+
+class DutyStatusResponse(BaseModel):
+    on_duty: bool
+    session: Optional[DutySessionResponse] = None
+    tracking_enabled: bool = False  # the client may only collect location while this is true
+
+
+class AssignedZoneRequest(BaseModel):
+    zone_code: Optional[str] = Field(default=None, max_length=64)  # null clears the assignment
+
+
+class TrackedPosition(BaseModel):
+    latitude: float
+    longitude: float
+    accuracy: Optional[float] = None
+    recorded_at: datetime
+    server_received_at: Optional[datetime] = None
+    sequence_number: Optional[int] = None
+    source: Optional[str] = None
+    age_seconds: Optional[float] = None
+    buffered: bool = False
+
+
+class TrackedNetwork(BaseModel):
+    """AP/Wi-Fi context. Present ONLY when it came from real telemetry (PHYSICAL_CONTROLLER) or the device itself (REAL) -- never from a simulator."""
+    access_point_code: Optional[str] = None
+    access_point_name: Optional[str] = None
+    bssid: Optional[str] = None
+    ssid: Optional[str] = None
+    ap_zone: Optional[str] = None
+    source: str
+    verified_by_controller: bool
+    ap_verification_status: Optional[str] = None
+    last_seen_at: Optional[datetime] = None
+    connection_status: Optional[str] = None
+
+
+class TrackedOfficer(BaseModel):
+    constable_id: uuid.UUID
+    badge_number: Optional[str] = None
+    station_id: Optional[uuid.UUID] = None
+    station_name: Optional[str] = None
+    battery_level: Optional[int] = None
+    on_duty: bool
+    duty_session_id: Optional[uuid.UUID] = None
+    duty_started_at: Optional[datetime] = None
+    device_identifier: Optional[str] = None
+    tracking_state: str  # live | delayed | stale | unavailable
+    unavailable_reason: Optional[str] = None
+    assigned_zone_code: Optional[str] = None
+    assigned_zone_name: Optional[str] = None
+    detected_zone_code: Optional[str] = None
+    detected_zone_name: Optional[str] = None
+    zone_status: Optional[str] = None  # CONFIRMED | OUTSIDE | UNCERTAIN | PENDING
+    zone_changed_at: Optional[datetime] = None
+    in_assigned_zone: Optional[bool] = None
+    position: Optional[TrackedPosition] = None  # hidden entirely while off duty
+    network: Optional[TrackedNetwork] = None
+
+
+class TrackingSnapshotResponse(BaseModel):
+    server_time: datetime
+    thresholds: dict
+    officers: List[TrackedOfficer]
+
+
+class LocationHistoryPoint(BaseModel):
+    latitude: float
+    longitude: float
+    accuracy: Optional[float] = None
+    recorded_at: Optional[datetime] = None
+    server_received_at: Optional[datetime] = None
+    sequence_number: Optional[int] = None
+    geographic_zone: Optional[str] = None
+    zone_status: Optional[str] = None
+    buffered: bool = False
+    advanced_projection: bool = True
+    duty_session_id: Optional[uuid.UUID] = None
+
+
+class LocationHistoryResponse(BaseModel):
+    constable_id: uuid.UUID
+    count: int
+    truncated: bool
+    points: List[LocationHistoryPoint]
+
 
 class ConstableStatusUpdateRequest(BaseModel):
     status: str  # validated against a restricted allow-list in the router, not the full AssignmentStatus/IncidentStatus enum
@@ -385,7 +528,12 @@ class DeviceResponse(BaseModel):
     is_charging: Optional[bool] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    # Device-clock time of the fix (NOT server receipt) -- see services/tracking.py.
     location_updated_at: Optional[datetime] = None
+    location_accuracy: Optional[float] = None
+    geographic_zone: Optional[str] = None
+    zone_status: Optional[str] = None
+    enrolment_status: EnrolmentStatus = EnrolmentStatus.approved
 
 
 # ---------------------------------------------------------------------------
@@ -718,7 +866,60 @@ class CCTVStreamStartResponse(BaseModel):
 # through.
 # ---------------------------------------------------------------------------
 
-class AccessPointCreateRequest(BaseModel):
+_BSSID_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
+def normalise_bssid(value: Optional[str]) -> Optional[str]:
+    """aa:bb:cc:dd:ee:ff (lower-case). Rejects malformed, all-zero, broadcast and multicast addresses -- none can be a real AP radio."""
+    if value is None:
+        return None
+    raw = re.sub(r"[:\-.]", "", value.strip().lower())
+    if not _BSSID_RE.match(raw):
+        raise ValueError("BSSID must be a 48-bit MAC address such as aa:bb:cc:dd:ee:ff")
+    if raw == "000000000000" or raw == "ffffffffffff":
+        raise ValueError("BSSID cannot be the all-zero or broadcast address")
+    if int(raw[1], 16) & 1:
+        raise ValueError("BSSID cannot be a multicast address")
+    return ":".join(raw[i:i + 2] for i in range(0, 12, 2))
+
+
+class _AccessPointInventoryFields(BaseModel):
+    manufacturer: Optional[str] = Field(default=None, max_length=64)
+    model: Optional[str] = Field(default=None, max_length=64)
+    serial_number: Optional[str] = Field(default=None, max_length=128)
+    bssid: Optional[str] = None
+    ssid: Optional[str] = Field(default=None, min_length=1, max_length=32)
+    management_ip: Optional[str] = None
+    controller_source: Optional[str] = Field(default=None, max_length=128)
+    building: Optional[str] = Field(default=None, max_length=128)
+    floor: Optional[str] = Field(default=None, max_length=32)
+    event_zone_codes: Optional[List[str]] = None
+
+    @field_validator("bssid")
+    @classmethod
+    def _check_bssid(cls, v):
+        return normalise_bssid(v) if v not in (None, "") else None
+
+    @field_validator("management_ip")
+    @classmethod
+    def _check_ip(cls, v):
+        if v in (None, ""):
+            return None
+        try:
+            return str(ipaddress.ip_address(v.strip()))
+        except ValueError:
+            raise ValueError("management_ip must be a valid IPv4/IPv6 address")
+
+    @field_validator("manufacturer", "model", "serial_number", "ssid", "controller_source", "building", "floor")
+    @classmethod
+    def _blank_to_none(cls, v):
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
+
+class AccessPointCreateRequest(_AccessPointInventoryFields):
     code: str = Field(..., min_length=1, max_length=32)
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = Field(default=None, max_length=1000)
@@ -732,7 +933,7 @@ class AccessPointCreateRequest(BaseModel):
     is_demo: bool = False
 
 
-class AccessPointUpdateRequest(BaseModel):
+class AccessPointUpdateRequest(_AccessPointInventoryFields):
     """All fields optional -- only the ones provided are changed. `code` is not updatable here (stable natural key, same convention as Device.device_identifier / CCTVCamera.camera_code)."""
     name: Optional[str] = Field(default=None, min_length=1, max_length=255)
     description: Optional[str] = Field(default=None, max_length=1000)
@@ -744,6 +945,17 @@ class AccessPointUpdateRequest(BaseModel):
     coverage_radius_m: Optional[float] = Field(default=None, gt=0)
     edge_node_id: Optional[str] = Field(default=None, max_length=128)
     is_demo: Optional[bool] = None
+
+
+class AccessPointRetireRequest(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=500)
+
+
+class APConfigChangeResponse(BaseModel):
+    at: datetime
+    by: Optional[uuid.UUID] = None
+    action: str
+    changes: dict = Field(default_factory=dict)
 
 
 class AccessPointResponse(BaseModel):
@@ -758,8 +970,33 @@ class AccessPointResponse(BaseModel):
     longitude: Optional[float] = None
     coverage_radius_m: Optional[float] = None
     edge_node_id: Optional[str] = None
+    manufacturer: Optional[str] = None
+    model: Optional[str] = None
+    serial_number: Optional[str] = None
+    bssid: Optional[str] = None
+    ssid: Optional[str] = None
+    management_ip: Optional[str] = None
+    controller_source: Optional[str] = None
+    building: Optional[str] = None
+    floor: Optional[str] = None
+    event_zone_codes: List[str] = Field(default_factory=list)
     enabled: bool
+    lifecycle_status: APLifecycleStatus = APLifecycleStatus.active
+    # Administrative record state vs. real-world proof, kept strictly apart:
+    verification_status: APVerificationStatus = APVerificationStatus.registered
+    verification_source: Optional[str] = None
+    verified_at: Optional[datetime] = None
+    last_verification_attempt_at: Optional[datetime] = None
+    last_verification_error: Optional[str] = None
+    last_seen_at: Optional[datetime] = None
+    integration_health: APIntegrationHealth = APIntegrationHealth.unconfigured
+    # DERIVED, never stored as an admin claim: "reachable"/"unreachable" only
+    # for a verified AP with telemetry; "unknown" for everything else.
+    reachability: str = "unknown"
+    # Legacy field kept for existing clients; mirrors `reachability` (online/offline/unknown).
     status: AccessPointStatus
+    retired_at: Optional[datetime] = None
+    retire_reason: Optional[str] = None
     is_demo: bool
     created_at: datetime
     updated_at: datetime
@@ -767,6 +1004,13 @@ class AccessPointResponse(BaseModel):
     # scan current presence rows to answer "how many officers are here" --
     # left unset (None) on single-camera-style reads that don't compute it.
     associated_device_count: Optional[int] = None
+    config_history: Optional[List[APConfigChangeResponse]] = None
+
+
+class APIntegrationStatusResponse(BaseModel):
+    configured: bool
+    kind: Optional[str] = None
+    message: str
 
 
 class PresenceAssociationRequest(BaseModel):
@@ -950,6 +1194,9 @@ class EventZoneResponse(BaseModel):
     deployment: Optional[str] = None
     zone_type: ZoneType
     coordinates: List[List[List[float]]]
+    # The same boundary as a GeoJSON Polygon object ({"type","coordinates"}),
+    # so map clients can consume it directly.
+    polygon: Optional[dict] = None
     priority: int
     color: Optional[str] = None
     enabled: bool

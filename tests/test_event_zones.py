@@ -143,7 +143,7 @@ async def test_admin_can_update_and_disable_zone(full_client, make_user, auth_he
 
 
 async def test_constable_location_update_detects_geographic_zone_and_transitions(
-    full_client, make_user, auth_header, make_constable
+    full_client, make_user, auth_header, go_on_duty, fix
 ):
     await make_user(phone="zone_admin_tr", password="pw", role="admin")
     admin_headers = await auth_header("zone_admin_tr", "pw")
@@ -171,78 +171,43 @@ async def test_constable_location_update_detects_geographic_zone_and_transitions
     }
     await full_client.post("/event-zones/", json=temple_zone, headers=admin_headers)
 
-    # Create Constable user + profile via fixture
-    constable_user, constable = await make_constable(phone="9999000001", password="pw", badge_number="AP-CONST-TR")
-    constable_headers = await auth_header("9999000001", "pw")
+    duty = await go_on_duty(phone="9999000001", badge_number="AP-CONST-TR")
+    constable, constable_headers = duty["constable"], duty["headers"]
 
-    # Step 1: Send fix INSIDE Main Gate: [80.6050, 16.5050]
-    loc1 = await full_client.post(
-        "/constables/me/location",
-        json={
-            "longitude": 80.6050,
-            "latitude": 16.5050,
-            "accuracy": 5.0,
-            "sequence_number": 1,
-        },
-        headers=constable_headers,
-    )
-    assert loc1.status_code == 200, loc1.text
-    data1 = loc1.json()
-    assert data1["geographic_zone"] == "ZONE-MAIN-GATE"
-    assert data1["zone_status"] == "CONFIRMED"
+    async def post(**kw):
+        return await full_client.post("/constables/me/location", json=fix(**kw), headers=constable_headers)
 
-    # Verify constable document state in DB
-    updated_c = await models.Constable.get(constable.id)
-    assert updated_c.current_geographic_zone == "ZONE-MAIN-GATE"
+    # Step 1: the FIRST fix of a duty period is accepted immediately -- inside Main Gate
+    r1 = await post(seq=1, lon=80.6050, lat=16.5050, accuracy=5.0, age_seconds=50)
+    assert r1.status_code == 200, r1.text
+    assert r1.json()["geographic_zone"] == "ZONE-MAIN-GATE"
+    assert r1.json()["zone_status"] == "CONFIRMED"
+    assert (await models.Constable.get(constable.id)).current_geographic_zone == "ZONE-MAIN-GATE"
 
-    # Step 2: Roam to Temple Sanctum: [80.6250, 16.5050]
-    loc2 = await full_client.post(
-        "/constables/me/location",
-        json={
-            "longitude": 80.6250,
-            "latitude": 16.5050,
-            "accuracy": 8.0,
-            "sequence_number": 2,
-        },
-        headers=constable_headers,
-    )
-    assert loc2.status_code == 200
-    data2 = loc2.json()
-    assert data2["geographic_zone"] == "ZONE-TEMPLE"
-    assert data2["zone_status"] == "CONFIRMED"
+    # Step 2: ONE fix inside Temple is not enough to change zone (hysteresis)
+    r2 = await post(seq=2, lon=80.6250, lat=16.5050, accuracy=8.0, age_seconds=40)
+    assert r2.json()["geographic_zone"] == "ZONE-MAIN-GATE"
+    assert r2.json()["zone_status"] == "PENDING"
+    assert r2.json()["zone_changed"] is False
 
-    # Step 3: Out-of-order sequence packet (sequence_number 1 arrives after 2)
-    loc3 = await full_client.post(
-        "/constables/me/location",
-        json={
-            "longitude": 80.6050,
-            "latitude": 16.5050,
-            "accuracy": 5.0,
-            "sequence_number": 1,
-        },
-        headers=constable_headers,
-    )
-    assert loc3.status_code == 200
-    # Constable's latest state must NOT have regressed to Main Gate
-    c_after_ooo = await models.Constable.get(constable.id)
-    assert c_after_ooo.current_geographic_zone == "ZONE-TEMPLE"
+    # Step 3: a second consecutive confirming fix completes the transition
+    r3 = await post(seq=3, lon=80.6250, lat=16.5050, accuracy=8.0, age_seconds=30)
+    assert r3.json()["geographic_zone"] == "ZONE-TEMPLE"
+    assert r3.json()["zone_status"] == "CONFIRMED"
+    assert r3.json()["zone_changed"] is True
 
-    # Step 4: Fix with high inaccuracy (> 50m) does not jump zone
-    loc4 = await full_client.post(
-        "/constables/me/location",
-        json={
-            "longitude": 80.6050,
-            "latitude": 16.5050,
-            "accuracy": 120.0,  # poor accuracy
-            "sequence_number": 3,
-        },
-        headers=constable_headers,
-    )
-    assert loc4.status_code == 200
-    data4 = loc4.json()
-    assert data4["zone_status"] == "UNCERTAIN"
-    # Remains in previously confirmed Temple zone due to hysteresis policy
-    assert data4["geographic_zone"] == "ZONE-TEMPLE"
+    # Step 4: an OLDER fix arriving late is history only and cannot regress the zone
+    r4 = await post(seq=4, lon=80.6050, lat=16.5050, accuracy=5.0, age_seconds=45)
+    assert r4.status_code == 200
+    assert r4.json()["result"] == "accepted_history"
+    assert r4.json()["projection_advanced"] is False
+    assert (await models.Constable.get(constable.id)).current_geographic_zone == "ZONE-TEMPLE"
+
+    # Step 5: a poor-accuracy fix (> 50 m) never changes the zone
+    r5 = await post(seq=5, lon=80.6050, lat=16.5050, accuracy=120.0, age_seconds=10)
+    assert r5.json()["zone_status"] == "UNCERTAIN"
+    assert r5.json()["geographic_zone"] == "ZONE-TEMPLE"
+    assert (await models.Constable.get(constable.id)).current_geographic_zone == "ZONE-TEMPLE"
 
 
 async def test_overlapping_zones_resolve_by_priority(full_client, make_user, auth_header):

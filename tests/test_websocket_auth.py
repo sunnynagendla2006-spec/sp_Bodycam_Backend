@@ -233,17 +233,15 @@ async def test_assignment_event_reaches_only_assigned_constable(
 # 33 & 34 & 35. location privacy: unrelated constable never sees it; station
 #               sees only its own constables' locations; control room does.
 # ---------------------------------------------------------------------------
-async def test_location_update_does_not_leak_to_unrelated_constable(full_client, make_constable):
-    _, constable_a = await make_constable(phone="w000000013a")
+async def test_location_update_does_not_leak_to_unrelated_constable(full_client, make_constable, go_on_duty, fix):
+    duty_a = await go_on_duty(phone="w000000013a")
     _, constable_b = await make_constable(phone="w000000013b")
     token_a = await _token(full_client, "w000000013a", "correct-horse-battery")
     token_b = await _token(full_client, "w000000013b", "correct-horse-battery")
 
     async with aconnect_ws(f"/ws/control_room?token={token_b}", full_client) as ws_b:
         a_headers = {"Authorization": f"Bearer {token_a}"}
-        resp = await full_client.post(
-            "/constables/me/location", json={"latitude": 10.0, "longitude": 20.0}, headers=a_headers
-        )
+        resp = await full_client.post("/constables/me/location", json=fix(seq=1, lat=10.0, lon=20.0), headers=a_headers)
         assert resp.status_code == 200
 
         await ws_b.send_text("ping")
@@ -251,21 +249,19 @@ async def test_location_update_does_not_leak_to_unrelated_constable(full_client,
         assert msg["event"] == "ack"  # never constable.location_updated for constable A
 
 
-async def test_station_receives_only_its_own_constables_locations(full_client, make_user, make_station, make_constable):
+async def test_station_receives_only_its_own_constables_locations(full_client, make_user, make_station, make_constable, go_on_duty, fix):
     station_a = await make_station(name="A")
     station_b = await make_station(name="B")
     await make_user(phone="w000000014s", password="pw", role=UserRole.station, station_id=station_a.id)
     _, constable_a = await make_constable(phone="w000000014a", station_id=station_a.id)
-    _, constable_b = await make_constable(phone="w000000014b", station_id=station_b.id)
+    await go_on_duty(phone="w000000014b", station_id=station_b.id)
 
     station_token = await _token(full_client, "w000000014s", "pw")
     token_b = await _token(full_client, "w000000014b", "correct-horse-battery")
 
     async with aconnect_ws(f"/ws/control_room?token={station_token}", full_client) as station_ws:
         b_headers = {"Authorization": f"Bearer {token_b}"}
-        resp = await full_client.post(
-            "/constables/me/location", json={"latitude": 1.0, "longitude": 2.0}, headers=b_headers
-        )
+        resp = await full_client.post("/constables/me/location", json=fix(seq=1, lat=1.0, lon=2.0), headers=b_headers)
         assert resp.status_code == 200
 
         await station_ws.send_text("ping")
@@ -273,18 +269,16 @@ async def test_station_receives_only_its_own_constables_locations(full_client, m
         assert msg["event"] == "ack"  # station A never gets constable B's (station B) location
 
 
-async def test_control_room_receives_location_updates(full_client, make_user, make_constable):
+async def test_control_room_receives_location_updates(full_client, make_user, go_on_duty, fix):
     await make_user(phone="w000000015", password="pw", role=UserRole.control_room)
-    _, constable = await make_constable(phone="w000000015c")
+    constable = (await go_on_duty(phone="w000000015c"))["constable"]
 
     cr_token = await _token(full_client, "w000000015", "pw")
     c_token = await _token(full_client, "w000000015c", "correct-horse-battery")
 
     async with aconnect_ws(f"/ws/control_room?token={cr_token}", full_client) as cr_ws:
         c_headers = {"Authorization": f"Bearer {c_token}"}
-        resp = await full_client.post(
-            "/constables/me/location", json={"latitude": 5.0, "longitude": 6.0}, headers=c_headers
-        )
+        resp = await full_client.post("/constables/me/location", json=fix(seq=1, lat=5.0, lon=6.0), headers=c_headers)
         assert resp.status_code == 200
 
         msg = await cr_ws.receive_json()

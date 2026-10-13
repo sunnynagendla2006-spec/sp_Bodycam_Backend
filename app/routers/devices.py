@@ -9,6 +9,7 @@ competing "device location" endpoint would create two sources of truth for
 the same fact.
 """
 import datetime
+import os
 import uuid
 from typing import Optional, Tuple
 
@@ -17,7 +18,7 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from .. import models, schemas
-from ..auth.deps import get_current_user
+from ..auth.deps import get_current_user, require_role
 from ..services.audit import log_action
 from ..services import events
 from ..services import alerts as alerts_service
@@ -29,6 +30,13 @@ router = APIRouter(prefix="/devices", tags=["Devices"])
 
 def _utcnow():
     return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _auto_approve() -> bool:
+    """Development convenience (DEVICE_AUTO_APPROVE=true); never honoured in production."""
+    if os.getenv("ENVIRONMENT", "development").strip().lower() == "production":
+        return False
+    return os.getenv("DEVICE_AUTO_APPROVE", "false").strip().lower() in ("1", "true", "yes")
 
 
 def compute_effective_status(device: models.Device, settings: dict, now=None) -> models.DeviceStatus:
@@ -62,20 +70,38 @@ async def _latest_battery(device_id: uuid.UUID) -> Optional[models.BatteryReadin
     ).sort(-models.BatteryReading.recorded_at).first_or_none()
 
 
-async def _latest_location(constable_id: Optional[uuid.UUID]) -> Tuple[Optional[float], Optional[float], Optional[datetime.datetime]]:
+async def _latest_location(constable_id: Optional[uuid.UUID], require_duty: bool = False) -> Tuple[Optional[float], Optional[float], Optional[datetime.datetime]]:
+    """
+    Last server-held position (the officer's projection -- never an old
+    buffered fix that was merely received last). Returns the DEVICE-CLOCK
+    time of the fix so freshness is judged on when it was recorded.
+    `require_duty=True` hides positions of officers who are off duty.
+    """
+    c = await _tracked_constable(constable_id, require_duty)
+    if c is None:
+        return None, None, None
+    return c.last_location_point.coordinates[1], c.last_location_point.coordinates[0], c.last_location_recorded_at
+
+
+async def _tracked_constable(constable_id: Optional[uuid.UUID], require_duty: bool) -> Optional[models.Constable]:
     if not constable_id:
-        return None, None, None
-    row = await models.ConstableLocation.find(
-        models.ConstableLocation.constable_id == constable_id
-    ).sort(-models.ConstableLocation.timestamp).first_or_none()
-    if not row:
-        return None, None, None
-    return row.location.coordinates[1], row.location.coordinates[0], row.timestamp
+        return None
+    c = await models.Constable.get(constable_id)
+    if c is None or c.last_location_point is None:
+        return None
+    if require_duty and c.active_duty_session_id is None:
+        return None
+    return c
 
 
 async def _to_device_response(device: models.Device, settings: dict) -> schemas.DeviceResponse:
     battery = await _latest_battery(device.id)
-    lat, lon, loc_ts = await _latest_location(device.constable_id)
+    tracked = await _tracked_constable(device.constable_id, require_duty=True)
+    lat = lon = loc_ts = accuracy = zone = zone_status = None
+    if tracked is not None:
+        lon, lat = tracked.last_location_point.coordinates
+        loc_ts, accuracy = tracked.last_location_recorded_at, tracked.last_location_accuracy
+        zone, zone_status = tracked.current_geographic_zone, tracked.zone_status
     return schemas.DeviceResponse(
         id=device.id,
         constable_id=device.constable_id,
@@ -93,6 +119,10 @@ async def _to_device_response(device: models.Device, settings: dict) -> schemas.
         latitude=lat,
         longitude=lon,
         location_updated_at=loc_ts,
+        location_accuracy=accuracy,
+        geographic_zone=zone,
+        zone_status=zone_status,
+        enrolment_status=device.enrolment_status,
     )
 
 
@@ -249,6 +279,9 @@ async def register_device(
             device_model=payload.device_model,
             status=models.DeviceStatus.online,
             last_seen_at=now,
+            # Self-registration only creates a REQUEST; an administrator must
+            # approve it before the device can start duty / report positions.
+            enrolment_status=models.EnrolmentStatus.approved if _auto_approve() else models.EnrolmentStatus.pending,
         )
         action = "device.registered"
         try:
@@ -523,3 +556,43 @@ async def get_device(
     await _observe_and_alert_device_status(device, settings, await _device_station_id(device))
 
     return await _to_device_response(device, settings)
+
+
+async def _set_enrolment(device_id: uuid.UUID, new_status: models.EnrolmentStatus, admin: models.User) -> models.Device:
+    device = await models.Device.get(device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="Device not found")
+    if device.constable_id is None:
+        raise HTTPException(status_code=409, detail="This device is not claimed by any officer")
+    device.enrolment_status = new_status
+    device.enrolment_reviewed_by = admin.id
+    device.enrolment_reviewed_at = _utcnow()
+    device.updated_at = _utcnow()
+    await device.save()
+    await log_action(
+        user_id=admin.id, action=f"device.enrolment_{new_status.value}",
+        details={"device_id": str(device.id), "device_identifier": device.device_identifier, "constable_id": str(device.constable_id)},
+    )
+    return device
+
+
+@router.post("/{device_id}/enrolment/approve", response_model=schemas.DeviceResponse)
+async def approve_device_enrolment(device_id: uuid.UUID, current_user: models.User = Depends(require_role("admin"))):
+    """admin only. Allows the officer to start duty (and therefore location tracking) from this device."""
+    device = await _set_enrolment(device_id, models.EnrolmentStatus.approved, current_user)
+    return await _to_device_response(device, load_settings())
+
+
+@router.post("/{device_id}/enrolment/revoke", response_model=schemas.DeviceResponse)
+async def revoke_device_enrolment(device_id: uuid.UUID, current_user: models.User = Depends(require_role("admin"))):
+    """admin only. Revokes the device and immediately ends any duty session running on it."""
+    device = await _set_enrolment(device_id, models.EnrolmentStatus.revoked, current_user)
+    session = await models.DutySession.find_one(
+        models.DutySession.device_id == device.id, models.DutySession.status == models.DutySessionStatus.active
+    )
+    if session is not None:
+        from .constables import end_duty_session
+        constable = await models.Constable.get(session.constable_id)
+        if constable is not None:
+            await end_duty_session(session, constable, reason="device_revoked", ended_by=current_user.id)
+    return await _to_device_response(device, load_settings())

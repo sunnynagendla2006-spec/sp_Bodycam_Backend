@@ -211,6 +211,7 @@ async def full_client(mongo_db):
     from app.routers import websocket as websocket_router_module
     from app.routers import event_zones as event_zones_router_module
     from app.routers import ap_telemetry as ap_telemetry_router_module
+    from app.routers import tracking as tracking_router_module
 
     tmp_upload_dir = tempfile.mkdtemp(prefix="sp_test_uploads_")
     media_router_module.UPLOAD_DIR = tmp_upload_dir
@@ -235,6 +236,7 @@ async def full_client(mongo_db):
     app.include_router(deployments_router_module.router)
     app.include_router(event_zones_router_module.router)
     app.include_router(ap_telemetry_router_module.router)
+    app.include_router(tracking_router_module.router)
 
 
     transport = ASGIWebSocketTransport(app=app)
@@ -245,8 +247,9 @@ async def full_client(mongo_db):
 @pytest.fixture(autouse=True)
 def _reset_login_rate_limiter():
     yield
-    from app.auth import rate_limit
+    from app.auth import rate_limit, request_limiter
     rate_limit._attempts.clear()
+    request_limiter.reset()
 
 
 @pytest.fixture(autouse=True)
@@ -491,3 +494,59 @@ async def auth_header(full_client):
         return {"Authorization": f"Bearer {token}"}
 
     return _auth_header
+
+
+# ---------------------------------------------------------------------------
+# Officer tracking helpers: duty sessions + well-formed location fixes
+# ---------------------------------------------------------------------------
+@pytest.fixture()
+def fix():
+    """Builds a complete, valid POST /constables/me/location body. `age_seconds` backdates recorded_at."""
+    import datetime as _dt
+
+    def _fix(seq: int = 1, lat: float = 16.5062, lon: float = 80.6480, accuracy: float = 8.0, age_seconds: float = 0.0, **extra):
+        body = {
+            "latitude": lat,
+            "longitude": lon,
+            "accuracy": accuracy,
+            "recorded_at": (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=age_seconds)).isoformat(),
+            "sequence_number": seq,
+        }
+        body.update(extra)
+        return body
+
+    return _fix
+
+
+@pytest_asyncio.fixture()
+async def go_on_duty(full_client, make_constable, auth_header):
+    """
+    Factory: creates a constable + an APPROVED device, logs in and starts a
+    duty session. Returns a dict(headers, constable, user, device, session_id).
+    """
+
+    async def _go_on_duty(phone: str = "t000000001", device_identifier: str = None, station_id=None, badge_number: str = None):
+        user, constable = await make_constable(phone=phone, station_id=station_id, badge_number=badge_number)
+        device = models.Device(
+            constable_id=constable.id, device_identifier=device_identifier or f"DEV-{phone}",
+            enrolment_status=models.EnrolmentStatus.approved,
+        )
+        await device.insert()
+        headers = await auth_header(phone, "correct-horse-battery")
+        resp = await full_client.post(
+            "/constables/me/duty-session/start", json={"device_identifier": device.device_identifier}, headers=headers
+        )
+        assert resp.status_code == 200, resp.text
+        # Backdate the session so tests can submit realistic queued (older) fixes;
+        # a dedicated test covers fixes that predate the session.
+        import datetime as _dt
+        await models.DutySession.get_motor_collection().update_one(
+            {"_id": uuid.UUID(resp.json()["session"]["id"])},
+            {"$set": {"started_at": _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=2)}},
+        )
+        return {
+            "headers": headers, "constable": constable, "user": user, "device": device,
+            "session_id": resp.json()["session"]["id"],
+        }
+
+    return _go_on_duty

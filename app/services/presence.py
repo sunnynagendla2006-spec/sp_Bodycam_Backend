@@ -70,6 +70,7 @@ async def process_association(
     # --- Duplicate / same-AP heartbeat: idempotent no-op on handoff -------
     if presence and presence.current_access_point_id == access_point.id:
         presence.last_seen_at = now
+        presence.source = source
         presence.status = models.PresenceConnectionStatus.connected
         if event_id:
             presence.last_event_id = event_id
@@ -102,6 +103,7 @@ async def process_association(
         presence.current_access_point_id = access_point.id
         presence.current_zone = access_point.zone
         presence.status = models.PresenceConnectionStatus.connected
+        presence.source = source
         presence.last_seen_at = now
         presence.last_event_id = event_id
         presence.handoff_count += 1
@@ -115,6 +117,7 @@ async def process_association(
             current_access_point_id=access_point.id,
             current_zone=access_point.zone,
             status=models.PresenceConnectionStatus.connected,
+            source=source,
             location_source="ACCESS_POINT",
             last_event_id=event_id,
             last_seen_at=now,

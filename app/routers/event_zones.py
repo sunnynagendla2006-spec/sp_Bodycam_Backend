@@ -3,10 +3,12 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pymongo.errors import DuplicateKeyError, OperationFailure
 
 from .. import geo, models, schemas
 from ..auth.deps import get_current_user
 from ..services.audit import log_action
+from ..services import events
 
 router = APIRouter(prefix="/event-zones", tags=["Event Zones"])
 
@@ -41,6 +43,7 @@ def _to_zone_response(zone: models.EventZone) -> schemas.EventZoneResponse:
         deployment=zone.deployment,
         zone_type=zone.zone_type,
         coordinates=zone.polygon.coordinates if zone.polygon else [],
+        polygon={"type": "Polygon", "coordinates": zone.polygon.coordinates} if zone.polygon else None,
         priority=zone.priority,
         color=zone.color,
         enabled=zone.enabled,
@@ -90,13 +93,20 @@ async def create_event_zone(
         created_by=current_user.id,
         updated_by=current_user.id,
     )
-    await zone.insert()
+    try:
+        await zone.insert()
+    except DuplicateKeyError:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Event zone with code '{payload.code}' already exists")
+    except OperationFailure as exc:
+        # MongoDB's 2dsphere index rejects geometry the simple ring check cannot see (e.g. self-intersecting rings).
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Boundary rejected by the geospatial index: {exc.details.get('errmsg', 'invalid geometry') if exc.details else 'invalid geometry'}")
 
     await log_action(
         user_id=current_user.id,
         action="event_zone.created",
         details={"zone_id": str(zone.id), "code": zone.code, "name": zone.name},
     )
+    await events.publish_event_zone_changed("created", zone.id, zone.code)
 
     return _to_zone_response(zone)
 
@@ -180,13 +190,17 @@ async def update_event_zone(
 
     zone.updated_at = datetime.now(timezone.utc)
     zone.updated_by = current_user.id
-    await zone.save()
+    try:
+        await zone.save()
+    except OperationFailure as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Boundary rejected by the geospatial index: {exc.details.get('errmsg', 'invalid geometry') if exc.details else 'invalid geometry'}")
 
     await log_action(
         user_id=current_user.id,
         action="event_zone.updated",
         details={"zone_id": str(zone.id), "code": zone.code},
     )
+    await events.publish_event_zone_changed("updated", zone.id, zone.code)
 
     return _to_zone_response(zone)
 
@@ -208,12 +222,16 @@ async def disable_event_zone(
     zone.enabled = False
     zone.updated_at = datetime.now(timezone.utc)
     zone.updated_by = current_user.id
-    await zone.save()
+    try:
+        await zone.save()
+    except OperationFailure as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Boundary rejected by the geospatial index: {exc.details.get('errmsg', 'invalid geometry') if exc.details else 'invalid geometry'}")
 
     await log_action(
         user_id=current_user.id,
         action="event_zone.disabled",
         details={"zone_id": str(zone.id), "code": zone.code},
     )
+    await events.publish_event_zone_changed("disabled", zone.id, zone.code)
 
     return _to_zone_response(zone)

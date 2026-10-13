@@ -23,6 +23,7 @@ from ..services.audit import log_action
 from ..services import events
 from ..services import presence as presence_service
 from ..services import ap_association
+from ..services import ap_integration
 from ..services import movement_state
 from .constables import get_own_constable
 from .devices import _require_own_device_for_constable, _device_station_id
@@ -36,7 +37,12 @@ router = APIRouter(prefix="/presence", tags=["Presence"])
 # demo works out of the box in development; set to "false" in any
 # environment where frontend-driven movement simulation of a real
 # officer's presence must not be possible.
-VIRTUAL_AP_MODE_ENABLED = os.getenv("VIRTUAL_AP_MODE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+#
+# In ENVIRONMENT=production the simulator is ALWAYS off, regardless of this
+# variable: simulated association/movement must never be able to appear as
+# real telemetry in a live deployment.
+_IS_PRODUCTION = os.getenv("ENVIRONMENT", "development").strip().lower() == "production"
+VIRTUAL_AP_MODE_ENABLED = (not _IS_PRODUCTION) and os.getenv("VIRTUAL_AP_MODE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 
 
 def _require_virtual_ap_mode_enabled():
@@ -386,9 +392,12 @@ async def virtual_map(
     results = []
     for ap in aps:
         lon, lat = geo.lon_lat(ap.location)
+        reachability = ap_integration.derive_reachability(ap)
         results.append(schemas.AccessPointResponse(
             id=ap.id, code=ap.code, name=ap.name, zone=ap.zone, deployment=ap.deployment,
-            station_id=None, latitude=lat, longitude=lon, enabled=ap.enabled, status=ap.status,
+            station_id=None, latitude=lat, longitude=lon, enabled=ap.enabled,
+            lifecycle_status=ap.lifecycle_status, verification_status=ap.verification_status,
+            reachability=reachability, status=ap_integration.legacy_status(reachability),
             is_demo=ap.is_demo, created_at=ap.created_at, updated_at=ap.updated_at,
         ))
     return results

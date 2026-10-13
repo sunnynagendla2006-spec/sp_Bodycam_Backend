@@ -8,6 +8,50 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 
+def _is_production() -> bool:
+    return os.getenv("ENVIRONMENT", "development").strip().lower() == "production"
+
+
+def _check_production_secrets() -> None:
+    """Refuse to start in production with well-known development secrets."""
+    if not _is_production():
+        return
+    weak = {
+        "EDGE_CONTROLLER_API_KEY": {"", "edge-controller-dev-key", "CHANGE_ME"},
+        "LIVEKIT_API_SECRET": {"secret", "CHANGE_ME"},
+        "LIVEKIT_API_KEY": {"devkey", "CHANGE_ME"},
+    }
+    problems = [
+        name for name, bad in weak.items()
+        # LiveKit keys only matter when explicitly set; the edge key is always required.
+        if os.getenv(name, "").strip() in bad and (name == "EDGE_CONTROLLER_API_KEY" or os.getenv(name) is not None)
+    ]
+    if problems:
+        raise RuntimeError(
+            "Refusing to start with ENVIRONMENT=production: these settings are unset or use a development default: "
+            + ", ".join(problems)
+        )
+
+
+async def _retention_loop():
+    """Deletes location history older than LOCATION_RETENTION_DAYS once a day."""
+    import asyncio
+    import datetime
+    import logging
+
+    from .services import retention
+
+    log = logging.getLogger(__name__)
+    while True:
+        try:
+            removed = await retention.purge_location_history()
+            if removed:
+                log.info("location retention: removed %d expired rows", removed)
+        except Exception:  # never let housekeeping take the API down
+            log.exception("location retention purge failed")
+        await asyncio.sleep(24 * 3600)
+
+
 # ---------------------------------------------------------------------------
 # Database initialization
 # ---------------------------------------------------------------------------
@@ -15,19 +59,34 @@ from fastapi.middleware.cors import CORSMiddleware
 # every Document model and idempotently creates any collection/index that
 # doesn't exist yet (including the partial-unique and 2dsphere indexes
 # declared on each Document's Settings). Safe to run on every startup.
+# Data-shape changes are handled by scripts/migrate_tracking_schema.py
+# (idempotent, non-destructive; run it once after upgrading).
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    import asyncio
+
+    _check_production_secrets()
     from .database import init_db
-    from .models import AccessPoint
 
     await init_db()
-    if await AccessPoint.count() == 0:
-        try:
-            from scripts.seed_ap_presence_demo import seed as seed_demo_aps
-            await seed_demo_aps()
-        except Exception:
-            pass
-    yield
+    # Demo/synthetic data is NEVER created implicitly. It requires an explicit
+    # opt-in AND a non-production environment (run scripts/seed_* by hand).
+    if not _is_production() and os.getenv("SEED_DEMO_DATA", "false").strip().lower() in ("1", "true", "yes"):
+        from .models import AccessPoint
+
+        if await AccessPoint.count() == 0:
+            try:
+                from scripts.seed_ap_presence_demo import seed as seed_demo_aps
+                await seed_demo_aps()
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception("SEED_DEMO_DATA requested but seeding failed")
+    retention_task = asyncio.create_task(_retention_loop()) if os.getenv("LOCATION_RETENTION_LOOP", "true").strip().lower() in ("1", "true", "yes") else None
+    try:
+        yield
+    finally:
+        if retention_task:
+            retention_task.cancel()
 
 
 app = FastAPI(title="Police Emergency Response API", lifespan=lifespan)
@@ -63,7 +122,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from .routers import auth, incidents, constables, media, settings, websocket, police_stations, audit_logs, devices, recordings, commands, alerts, live_stream, cctv, access_points, presence, deployments, event_zones, ap_telemetry
+from .routers import auth, incidents, constables, media, settings, websocket, police_stations, audit_logs, devices, recordings, commands, alerts, live_stream, cctv, access_points, presence, deployments, event_zones, ap_telemetry, tracking
 app.include_router(auth.router)
 app.include_router(incidents.router)
 app.include_router(constables.router)
@@ -82,6 +141,7 @@ app.include_router(presence.router)
 app.include_router(deployments.router)
 app.include_router(event_zones.router)
 app.include_router(ap_telemetry.router)
+app.include_router(tracking.router)
 
 
 # Authorized CCTV monitoring is an optional subsystem (see

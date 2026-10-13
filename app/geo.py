@@ -133,3 +133,42 @@ def point_in_polygon(lon: float, lat: float, rings: List[List[List[float]]]) -> 
             return False
     return True
 
+
+
+# ---------------------------------------------------------------------------
+# Boundary distance (used for zone-transition hysteresis)
+# ---------------------------------------------------------------------------
+
+def _to_local_xy(lon: float, lat: float, lon0: float, lat0: float) -> Tuple[float, float]:
+    """Equirectangular projection around (lon0, lat0), in meters. Accurate to well under a metre over a festival-sized area."""
+    import math
+
+    x = math.radians(lon - lon0) * 6371000.0 * math.cos(math.radians(lat0))
+    y = math.radians(lat - lat0) * 6371000.0
+    return x, y
+
+
+def distance_to_ring_meters(lon: float, lat: float, ring: List[List[float]]) -> float:
+    """Shortest distance in meters from a point to a ring's edges (0 if it lies on an edge)."""
+    px, py = 0.0, 0.0  # the query point is the projection origin
+    best = float("inf")
+    n = len(ring)
+    for i in range(n - 1):
+        ax, ay = _to_local_xy(ring[i][0], ring[i][1], lon, lat)
+        bx, by = _to_local_xy(ring[i + 1][0], ring[i + 1][1], lon, lat)
+        dx, dy = bx - ax, by - ay
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq == 0:
+            t = 0.0
+        else:
+            t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / seg_len_sq))
+        cx, cy = ax + t * dx, ay + t * dy
+        dist = (cx * cx + cy * cy) ** 0.5
+        if dist < best:
+            best = dist
+    return best
+
+
+def distance_to_polygon_boundary_meters(lon: float, lat: float, rings: List[List[List[float]]]) -> float:
+    """Distance to the nearest edge of ANY ring (outer boundary or hole) -- the distance a fix must travel to change inside/outside."""
+    return min(distance_to_ring_meters(lon, lat, ring) for ring in rings if ring)

@@ -54,10 +54,11 @@ from app.models import (
     PresenceEventSource,
 )
 from app.auth.security import hash_password
+from app.auth.seed_guard import seed_password
 from app.services.presence import process_association
 
 DEPLOYMENT_NAME = "JATARA-DEMO-001"
-TEST_PASSWORD = "Demo@12345"  # matches seed_demo.py/seed_test_data.py's existing convention
+TEST_PASSWORD = seed_password()  # from SEED_PASSWORD or generated per run -- never hardcoded
 
 OFFICERS = [
     {"phone": "9990003023", "badge": "POL-023", "device": "DEV-023", "ap": "AP-01"},

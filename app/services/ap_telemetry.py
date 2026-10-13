@@ -15,7 +15,7 @@ from fastapi import HTTPException, status
 from pymongo.errors import DuplicateKeyError
 
 from .. import models, schemas
-from . import events, movement_state
+from . import ap_integration, events, movement_state
 from . import presence as presence_service
 
 MAX_SKEW_SECONDS = int(os.getenv("EDGE_CONTROLLER_MAX_SKEW_SECONDS", "300").strip())
@@ -190,7 +190,16 @@ def validate_timestamp_skew(occurred_at: datetime.datetime, max_skew_seconds: in
 async def resolve_access_point(
     ap_code: Optional[str], ap_bssid: Optional[str]
 ) -> Optional[models.AccessPoint]:
-    """Resolves AccessPoint by code, edge_node_id, or natural key."""
+    """Resolves AccessPoint by registered BSSID, code, edge_node_id, or natural key."""
+    if ap_bssid:
+        try:
+            normalised = schemas.normalise_bssid(ap_bssid)
+        except ValueError:
+            normalised = None
+        if normalised:
+            ap = await models.AccessPoint.find_one(models.AccessPoint.bssid == normalised)
+            if ap:
+                return ap
     if ap_code:
         ap = await models.AccessPoint.find_one(models.AccessPoint.code == ap_code)
         if ap:
@@ -299,6 +308,12 @@ async def process_edge_telemetry_event(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Access point '{event.ap_code or event.ap_bssid}' not found in registry",
         )
+
+    # The authenticated collector genuinely saw this AP: record real telemetry
+    # (last_seen_at, integration health, and BSSID-matched verification).
+    await ap_integration.record_edge_telemetry(
+        access_point, event_bssid=event.ap_bssid, occurred_at=event.occurred_at, controller_id=event.controller_id
+    )
 
     # 4. Enrolled Device and Officer resolution
     device, constable = await resolve_enrolled_officer_and_device(

@@ -192,11 +192,19 @@ async def publish_constable_location_updated(
     geographic_zone: Optional[str] = None,
     zone_status: Optional[str] = None,
     source: str = "GNSS",
+    duty_session_id: Optional[uuid.UUID] = None,
+    buffered: bool = False,
+    assigned_zone: Optional[str] = None,
 ):
     """
     Goes to control_room + the constable's OWN station only -- never to any
     other constable. This is the one event type explicitly called out in
     Part 9 as never-broadcast-globally.
+
+    Published ONLY when an officer's position genuinely advanced (a newer
+    fix than the one already held) -- never for duplicates or late history,
+    so a marker can only move because real new coordinates arrived. Clients
+    must derive live/delayed/stale from `recorded_at`, not receipt time.
     """
     payload = {
         "constable_id": str(constable_id),
@@ -210,8 +218,49 @@ async def publish_constable_location_updated(
         "geographic_zone": geographic_zone,
         "zone_status": zone_status,
         "source": source,
+        "duty_session_id": str(duty_session_id) if duty_session_id else None,
+        "buffered": buffered,
+        "assigned_zone": assigned_zone,
     }
     event = build_event("constable.location_updated", payload)
+    await manager.send_to_control_room(event)
+    await manager.send_to_station(station_id, event)
+
+
+async def publish_event_zone_changed(action: str, zone_id: uuid.UUID, code: str):
+    """Boundary/metadata of a geographic zone changed -- map clients refetch zones. control_room + all stations."""
+    event = build_event(f"event_zone.{action}", {"zone_id": str(zone_id), "code": code})
+    await manager.send_to_control_room(event)
+
+
+async def publish_constable_duty_changed(
+    constable_id: uuid.UUID,
+    station_id: Optional[uuid.UUID],
+    on_duty: bool,
+    duty_session_id: Optional[uuid.UUID] = None,
+    reason: Optional[str] = None,
+):
+    """Duty (tracking authorisation) started or ended. control_room + the officer's station."""
+    event = build_event("constable.duty_changed", {
+        "constable_id": str(constable_id),
+        "on_duty": on_duty,
+        "duty_session_id": str(duty_session_id) if duty_session_id else None,
+        "reason": reason,
+    })
+    await manager.send_to_control_room(event)
+    await manager.send_to_station(station_id, event)
+
+
+async def publish_constable_assignment_changed(
+    constable_id: uuid.UUID,
+    station_id: Optional[uuid.UUID],
+    assigned_zone_code: Optional[str],
+):
+    """An officer's ASSIGNED duty zone changed (administrative; independent of the detected zone)."""
+    event = build_event("constable.assignment_changed", {
+        "constable_id": str(constable_id),
+        "assigned_zone": assigned_zone_code,
+    })
     await manager.send_to_control_room(event)
     await manager.send_to_station(station_id, event)
 

@@ -110,7 +110,7 @@ async def find_nearest_access_point(
             id=doc["_id"], code=doc["code"], name=doc["name"], zone=doc.get("zone"),
             deployment=doc.get("deployment"), station_id=doc.get("station_id"),
             location=doc.get("location"), enabled=doc.get("enabled", True),
-            status=doc.get("status", models.AccessPointStatus.online),
+            status=doc.get("status", models.AccessPointStatus.unknown),
             is_demo=doc.get("is_demo", False), created_at=doc["created_at"], updated_at=doc["updated_at"],
         )
         return ap, doc["distance_meters"]
