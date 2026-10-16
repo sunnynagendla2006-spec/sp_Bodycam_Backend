@@ -1,8 +1,11 @@
-from pydantic import BaseModel, ConfigDict, Field
-from typing import Optional, List
+import enum
+import ipaddress
+import re
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from typing import Optional, List, Literal
 import uuid
 from datetime import datetime
-from .models import UserRole, UserStatus, ConstableStatus, IncidentStatus, MediaType, UploadStatus, AssignmentStatus, DeviceStatus, AlertType, AlertSeverity, AlertStatus, RecordingTriggerType, RecordingStatus, RemoteCommandType, RemoteCommandStatus, LiveStreamStatus, LiveStreamStartedBy, CCTVProviderType, CCTVStreamProtocol, CCTVCameraStatus, CCTVStreamSessionStatus, CCTVCapabilities, AccessPointStatus, PresenceConnectionStatus, PresenceEventSource, DeploymentStatus
+from .models import UserRole, UserStatus, ConstableStatus, IncidentStatus, MediaType, UploadStatus, AssignmentStatus, DeviceStatus, AlertType, AlertSeverity, AlertStatus, RecordingTriggerType, RecordingStatus, RemoteCommandType, RemoteCommandStatus, LiveStreamStatus, LiveStreamStartedBy, CCTVProviderType, CCTVStreamProtocol, CCTVConnectionMode, CCTVNetworkAccess, CCTVVendorPreset, CCTVCameraStatus, CCTVStreamSessionStatus, CCTVCapabilities, AccessPointStatus, APVerificationStatus, APLifecycleStatus, APIntegrationHealth, EnrolmentStatus, PresenceConnectionStatus, PresenceEventSource, DeploymentStatus, ZoneType
 
 class UserBase(BaseModel):
     phone: str
@@ -264,21 +267,172 @@ class ConstableMeResponse(BaseModel):
     is_active: bool
 
 class ConstableMeLocationUpdate(BaseModel):
-    """Body for POST /constables/me/location -- deliberately distinct from
-    the legacy ConstableLocationUpdate (location_lon/location_lat) used by
-    the existing admin-facing POST /constables/{id}/location, matching the
-    field names the Flutter app will actually send."""
+    """
+    Body for POST /constables/me/location (and each item of the batch
+    endpoint). Every field the server needs to trust, order and de-duplicate
+    a fix is REQUIRED: genuine coordinates, the device-reported accuracy,
+    the device-clock time the fix was taken, and a per-duty-session sequence
+    number. The constable identity is never in the body -- it comes from the JWT.
+    """
     latitude: float = Field(..., ge=-90.0, le=90.0)
     longitude: float = Field(..., ge=-180.0, le=180.0)
-    accuracy: Optional[float] = Field(default=None, ge=0.0)
+    accuracy: float = Field(..., ge=0.0, le=10000.0)  # horizontal accuracy radius, meters
+    recorded_at: datetime
+    sequence_number: int = Field(..., ge=0)
+    duty_session_id: Optional[uuid.UUID] = None  # defaults to the officer's active session
+    device_identifier: Optional[str] = Field(default=None, max_length=128)
+    battery_level: Optional[int] = Field(default=None, ge=0, le=100)
+    network_type: Optional[Literal["WIFI", "CELLULAR", "ETHERNET", "OFFLINE", "UNKNOWN"]] = None
+    source: Literal["GNSS", "FUSED", "NETWORK", "CELL"] = "GNSS"
+    # Android Location.isMock()/isFromMockProvider(): a mocked fix is never genuine.
+    is_mock_provider: Optional[bool] = None
+    deployment: Optional[str] = Field(default=None, max_length=128)
+
+
+class ConstableLocationBatchRequest(BaseModel):
+    """Queued fixes flushed after a connectivity gap. Order inside the batch does not matter; each item is judged on its own recorded_at/sequence."""
+    fixes: List[ConstableMeLocationUpdate] = Field(..., min_length=1, max_length=100)
+
 
 class ConstableLocationResponse(BaseModel):
     status: str
+    # accepted        -> stored and moved the officer's position
+    # accepted_history-> stored as history only (older than the position already held)
+    # duplicate       -> this (duty session, sequence) was already ingested; nothing changed
+    result: str = "accepted"
     constable_id: uuid.UUID
+    duty_session_id: Optional[uuid.UUID] = None
     latitude: float
     longitude: float
     accuracy: Optional[float] = None
     timestamp: datetime
+    recorded_at: Optional[datetime] = None
+    server_received_at: Optional[datetime] = None
+    sequence_number: Optional[int] = None
+    geographic_zone: Optional[str] = None
+    zone_status: Optional[str] = None
+    zone_changed: bool = False
+    projection_advanced: bool = False
+    buffered: bool = False
+    source: Optional[str] = "GNSS"
+
+
+class ConstableLocationBatchItemResult(BaseModel):
+    sequence_number: int
+    result: str  # accepted | accepted_history | duplicate | rejected
+    code: Optional[str] = None  # machine-readable reason when rejected
+    detail: Optional[str] = None
+
+
+class ConstableLocationBatchResponse(BaseModel):
+    total: int
+    accepted: int
+    duplicate: int
+    rejected: int
+    results: List[ConstableLocationBatchItemResult]
+
+
+class DutyStartRequest(BaseModel):
+    device_identifier: str = Field(..., min_length=1, max_length=128)
+
+
+class DutySessionResponse(BaseModel):
+    id: uuid.UUID
+    constable_id: uuid.UUID
+    device_identifier: str
+    status: str
+    started_at: datetime
+    ended_at: Optional[datetime] = None
+    end_reason: Optional[str] = None
+    assigned_zone_code: Optional[str] = None
+    fix_count: int = 0
+
+
+class DutyStatusResponse(BaseModel):
+    on_duty: bool
+    session: Optional[DutySessionResponse] = None
+    tracking_enabled: bool = False  # the client may only collect location while this is true
+
+
+class AssignedZoneRequest(BaseModel):
+    zone_code: Optional[str] = Field(default=None, max_length=64)  # null clears the assignment
+
+
+class TrackedPosition(BaseModel):
+    latitude: float
+    longitude: float
+    accuracy: Optional[float] = None
+    recorded_at: datetime
+    server_received_at: Optional[datetime] = None
+    sequence_number: Optional[int] = None
+    source: Optional[str] = None
+    age_seconds: Optional[float] = None
+    buffered: bool = False
+
+
+class TrackedNetwork(BaseModel):
+    """AP/Wi-Fi context. Present ONLY when it came from real telemetry (PHYSICAL_CONTROLLER) or the device itself (REAL) -- never from a simulator."""
+    access_point_code: Optional[str] = None
+    access_point_name: Optional[str] = None
+    bssid: Optional[str] = None
+    ssid: Optional[str] = None
+    ap_zone: Optional[str] = None
+    source: str
+    verified_by_controller: bool
+    ap_verification_status: Optional[str] = None
+    last_seen_at: Optional[datetime] = None
+    connection_status: Optional[str] = None
+
+
+class TrackedOfficer(BaseModel):
+    constable_id: uuid.UUID
+    badge_number: Optional[str] = None
+    station_id: Optional[uuid.UUID] = None
+    station_name: Optional[str] = None
+    battery_level: Optional[int] = None
+    on_duty: bool
+    duty_session_id: Optional[uuid.UUID] = None
+    duty_started_at: Optional[datetime] = None
+    device_identifier: Optional[str] = None
+    tracking_state: str  # live | delayed | stale | unavailable
+    unavailable_reason: Optional[str] = None
+    assigned_zone_code: Optional[str] = None
+    assigned_zone_name: Optional[str] = None
+    detected_zone_code: Optional[str] = None
+    detected_zone_name: Optional[str] = None
+    zone_status: Optional[str] = None  # CONFIRMED | OUTSIDE | UNCERTAIN | PENDING
+    zone_changed_at: Optional[datetime] = None
+    in_assigned_zone: Optional[bool] = None
+    position: Optional[TrackedPosition] = None  # hidden entirely while off duty
+    network: Optional[TrackedNetwork] = None
+
+
+class TrackingSnapshotResponse(BaseModel):
+    server_time: datetime
+    thresholds: dict
+    officers: List[TrackedOfficer]
+
+
+class LocationHistoryPoint(BaseModel):
+    latitude: float
+    longitude: float
+    accuracy: Optional[float] = None
+    recorded_at: Optional[datetime] = None
+    server_received_at: Optional[datetime] = None
+    sequence_number: Optional[int] = None
+    geographic_zone: Optional[str] = None
+    zone_status: Optional[str] = None
+    buffered: bool = False
+    advanced_projection: bool = True
+    duty_session_id: Optional[uuid.UUID] = None
+
+
+class LocationHistoryResponse(BaseModel):
+    constable_id: uuid.UUID
+    count: int
+    truncated: bool
+    points: List[LocationHistoryPoint]
+
 
 class ConstableStatusUpdateRequest(BaseModel):
     status: str  # validated against a restricted allow-list in the router, not the full AssignmentStatus/IncidentStatus enum
@@ -374,7 +528,12 @@ class DeviceResponse(BaseModel):
     is_charging: Optional[bool] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    # Device-clock time of the fix (NOT server receipt) -- see services/tracking.py.
     location_updated_at: Optional[datetime] = None
+    location_accuracy: Optional[float] = None
+    geographic_zone: Optional[str] = None
+    zone_status: Optional[str] = None
+    enrolment_status: EnrolmentStatus = EnrolmentStatus.approved
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +551,10 @@ class RecordingStartRequest(BaseModel):
     # existing RecordingEngine default and every pre-existing caller that
     # doesn't send this field at all.
     camera_lens_direction: Optional[str] = None
+    # Optional, backward compatible: a CLIENT-generated recording id (the phone's own UUID) makes start idempotent and keeps
+    # the same id when a recording moves between a site receiver and this server. Older clients simply omit both fields.
+    recording_id: Optional[uuid.UUID] = None
+    site_id: Optional[uuid.UUID] = None
 
 class RecordingSessionResponse(BaseModel):
     id: uuid.UUID
@@ -413,6 +576,11 @@ class RecordingSessionResponse(BaseModel):
     # this is "ready".
     playable_status: str = "not_ready"
     camera_lens_direction: str = "back"
+    # Site transport (None/"central" for ordinary online recordings).
+    site_id: Optional[uuid.UUID] = None
+    receiver_id: Optional[uuid.UUID] = None
+    origin: str = "central"
+    flags: List[str] = []
     model_config = ConfigDict(from_attributes=True)
 
 class VideoChunkResponse(BaseModel):
@@ -434,6 +602,9 @@ class VideoChunkResponse(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     recorded_at: Optional[datetime] = None
+    # SHA-256 of the bytes exactly as captured by the phone (`file_hash` may describe a watermarked derivative).
+    original_hash: Optional[str] = None
+    received_via: str = "central"
     model_config = ConfigDict(from_attributes=True)
 
 class RecordingManifestResponse(BaseModel):
@@ -631,6 +802,11 @@ class CCTVCameraResponse(BaseModel):
     last_error: Optional[str] = None
     is_demo: bool
 
+    # Building association (None for cameras registered before buildings existed).
+    building_id: Optional[uuid.UUID] = None
+    channel: Optional[int] = None
+    sort_order: int = 0
+
     created_at: datetime
     updated_at: datetime
     created_by: Optional[uuid.UUID] = None
@@ -690,13 +866,335 @@ class CCTVStreamSessionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class CCTVPlaybackResponse(BaseModel):
+    """Everything a browser needs to watch ONE camera over WebRTC (WHEP). `token` is a short-lived playback token, never a camera credential or a source URL."""
+    camera_id: uuid.UUID
+    protocol: Literal["webrtc"] = "webrtc"
+    path: str
+    whep_url: str
+    token: str
+    expires_at: datetime
+    ttl_seconds: int
+
+
 class CCTVStreamStartResponse(BaseModel):
-    """Never includes a LiveKit API secret -- only a short-lived signed viewer token, when a media gateway actually produced one (see CCTVProvider.start_stream)."""
+    """Never includes a LiveKit API secret -- only a short-lived signed viewer token, when a media gateway actually produced one (see CCTVProvider.start_stream). `playback` is set for gateway (MediaMTX) streams."""
     session: CCTVStreamSessionResponse
     livekit_url: Optional[str] = None
     token: Optional[str] = None
     identity: Optional[str] = None
     can_publish: bool = False
+    playback: Optional[CCTVPlaybackResponse] = None
+
+
+class CCTVStreamingConfigResponse(BaseModel):
+    """Operator-tunable dashboard behaviour (all from environment, see .env.example)."""
+    gateway_configured: bool
+    rotation_seconds: int
+    max_concurrent_streams: int
+    prefetch_next: bool
+    playback_ttl_seconds: int
+
+
+class CCTVPlaybackReport(BaseModel):
+    """A viewer's report that playback of a camera failed (or recovered). Never carries URLs or credentials; free text is length-bounded."""
+    state: Literal["error", "recovered"]
+    reason: Optional[str] = Field(default=None, max_length=200)
+
+
+# ---------------------------------------------------------------------------
+# Buildings (one control-room slot each) and their cameras
+# ---------------------------------------------------------------------------
+
+_BUILDING_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{1,63}$")
+_HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.\-]{0,251}[A-Za-z0-9])?$")
+
+
+def _validate_host(value: Optional[str]) -> Optional[str]:
+    """Hostname or bare IP. Never a URL: no scheme, userinfo, port or path may be smuggled in."""
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        ipaddress.ip_address(value)
+        return value
+    except ValueError:
+        pass
+    if not _HOST_RE.match(value):
+        raise ValueError("must be a hostname or IP address without scheme, port or path")
+    return value
+
+
+class BuildingCameraInput(BaseModel):
+    """One camera row inside a building. In NVR mode only `channel` selects the stream (host/port/path come from the building's recorder); in direct-IP mode the camera's own endpoint is used."""
+    name: str = Field(..., min_length=1, max_length=255)
+    camera_code: Optional[str] = Field(default=None, max_length=64)  # auto-generated from the building code when omitted
+    description: Optional[str] = None
+    channel: Optional[int] = Field(default=None, ge=1, le=512)
+    sort_order: Optional[int] = Field(default=None, ge=0, le=10000)
+    enabled: bool = True
+    provider_type: Literal["rtsp", "onvif"] = "rtsp"
+    # direct-IP mode only:
+    stream_protocol: CCTVStreamProtocol = CCTVStreamProtocol.rtsp
+    stream_host: Optional[str] = None
+    stream_port: int = Field(default=554, ge=1, le=65535)
+    stream_path: Optional[str] = None
+    management_url: Optional[str] = None
+    username: Optional[str] = None
+    secret: Optional[str] = None  # plaintext ONLY as input; encrypted immediately, never echoed
+    latitude: Optional[float] = Field(default=None, ge=-90.0, le=90.0)
+    longitude: Optional[float] = Field(default=None, ge=-180.0, le=180.0)
+
+    @field_validator("stream_host")
+    @classmethod
+    def _host(cls, v):
+        return _validate_host(v)
+
+
+class BuildingCameraUpdate(BaseModel):
+    """All optional. `secret` omitted = unchanged; `clear_secret` removes it explicitly."""
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    description: Optional[str] = None
+    channel: Optional[int] = Field(default=None, ge=1, le=512)
+    sort_order: Optional[int] = Field(default=None, ge=0, le=10000)
+    enabled: Optional[bool] = None
+    provider_type: Optional[Literal["rtsp", "onvif"]] = None
+    stream_protocol: Optional[CCTVStreamProtocol] = None
+    stream_host: Optional[str] = None
+    stream_port: Optional[int] = Field(default=None, ge=1, le=65535)
+    stream_path: Optional[str] = None
+    management_url: Optional[str] = None
+    username: Optional[str] = None
+    secret: Optional[str] = None
+    clear_secret: bool = False
+    latitude: Optional[float] = Field(default=None, ge=-90.0, le=90.0)
+    longitude: Optional[float] = Field(default=None, ge=-180.0, le=180.0)
+
+    @field_validator("stream_host")
+    @classmethod
+    def _host(cls, v):
+        return _validate_host(v)
+
+
+class BuildingBase(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    code: str
+    owner_name: Optional[str] = Field(default=None, max_length=255)
+    owner_contact: Optional[str] = Field(default=None, max_length=255)
+    zone: Optional[str] = Field(default=None, max_length=64)
+    address: Optional[str] = Field(default=None, max_length=500)
+    latitude: float = Field(..., ge=-90.0, le=90.0)
+    longitude: float = Field(..., ge=-180.0, le=180.0)
+    public_ip: Optional[str] = None
+    connection_mode: CCTVConnectionMode = CCTVConnectionMode.nvr
+    network_access: CCTVNetworkAccess = CCTVNetworkAccess.vpn
+    authorized_networks: List[str] = Field(default_factory=list, max_length=32)
+    recorder_vendor: CCTVVendorPreset = CCTVVendorPreset.custom
+    recorder_protocol: CCTVStreamProtocol = CCTVStreamProtocol.rtsp
+    recorder_host: Optional[str] = None
+    recorder_port: int = Field(default=554, ge=1, le=65535)
+    stream_path_template: Optional[str] = Field(default=None, max_length=300)
+    recorder_username: Optional[str] = Field(default=None, max_length=128)
+
+    @field_validator("code")
+    @classmethod
+    def _code(cls, v):
+        v = v.strip()
+        if not _BUILDING_CODE_RE.match(v):
+            raise ValueError("code must be 2-64 characters: letters, digits, '.', '_' or '-'")
+        return v
+
+    @field_validator("public_ip")
+    @classmethod
+    def _public_ip(cls, v):
+        if v is None or not v.strip():
+            return None
+        try:
+            return str(ipaddress.ip_address(v.strip()))
+        except ValueError:
+            raise ValueError("public_ip must be a valid IP address")
+
+    @field_validator("recorder_host")
+    @classmethod
+    def _recorder_host(cls, v):
+        return _validate_host(v)
+
+    @field_validator("authorized_networks")
+    @classmethod
+    def _networks(cls, v):
+        from .services import cctv_security
+        return [str(n) for n in cctv_security.parse_authorized_networks(v)]
+
+    @field_validator("stream_path_template")
+    @classmethod
+    def _template(cls, v):
+        from .services import cctv_sources
+        return cctv_sources.validate_path_template(v)
+
+
+class BuildingCreateRequest(BuildingBase):
+    recorder_secret: Optional[str] = None  # plaintext ONLY as input
+    cameras: List[BuildingCameraInput] = Field(default_factory=list, max_length=128)
+    is_demo: bool = False
+
+    @model_validator(mode="after")
+    def _consistency(self):
+        check_building_consistency(self)
+        return self
+
+
+class BuildingUpdateRequest(BaseModel):
+    """All optional; only provided fields change. The cross-field rules are re-checked against the merged result by the router."""
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    owner_name: Optional[str] = Field(default=None, max_length=255)
+    owner_contact: Optional[str] = Field(default=None, max_length=255)
+    zone: Optional[str] = Field(default=None, max_length=64)
+    address: Optional[str] = Field(default=None, max_length=500)
+    latitude: Optional[float] = Field(default=None, ge=-90.0, le=90.0)
+    longitude: Optional[float] = Field(default=None, ge=-180.0, le=180.0)
+    public_ip: Optional[str] = None
+    clear_public_ip: bool = False
+    connection_mode: Optional[CCTVConnectionMode] = None
+    network_access: Optional[CCTVNetworkAccess] = None
+    authorized_networks: Optional[List[str]] = Field(default=None, max_length=32)
+    recorder_vendor: Optional[CCTVVendorPreset] = None
+    recorder_protocol: Optional[CCTVStreamProtocol] = None
+    recorder_host: Optional[str] = None
+    recorder_port: Optional[int] = Field(default=None, ge=1, le=65535)
+    stream_path_template: Optional[str] = Field(default=None, max_length=300)
+    recorder_username: Optional[str] = Field(default=None, max_length=128)
+    recorder_secret: Optional[str] = None
+    clear_recorder_secret: bool = False
+
+    @field_validator("public_ip")
+    @classmethod
+    def _public_ip(cls, v):
+        if v is None or not v.strip():
+            return None
+        try:
+            return str(ipaddress.ip_address(v.strip()))
+        except ValueError:
+            raise ValueError("public_ip must be a valid IP address")
+
+    @field_validator("recorder_host")
+    @classmethod
+    def _recorder_host(cls, v):
+        return _validate_host(v)
+
+    @field_validator("authorized_networks")
+    @classmethod
+    def _networks(cls, v):
+        if v is None:
+            return None
+        from .services import cctv_security
+        return [str(n) for n in cctv_security.parse_authorized_networks(v)]
+
+    @field_validator("stream_path_template")
+    @classmethod
+    def _template(cls, v):
+        from .services import cctv_sources
+        return cctv_sources.validate_path_template(v)
+
+
+def check_building_consistency(b) -> None:
+    """Cross-field rules shared by create and the router's merged update. Raises ValueError."""
+    if b.connection_mode == CCTVConnectionMode.nvr:
+        if not b.recorder_host:
+            raise ValueError("recorder_host is required for NVR/DVR mode")
+        if b.recorder_vendor == CCTVVendorPreset.custom and "{channel}" not in (b.stream_path_template or ""):
+            raise ValueError("a custom recorder needs a stream_path_template containing {channel}")
+    if b.network_access == CCTVNetworkAccess.public_direct and not b.public_ip:
+        raise ValueError("public_ip is required when network_access is public_direct")
+
+
+class BuildingCameraBrief(BaseModel):
+    """Minimal per-camera data for a control-room slot. No hosts, ports, paths or credentials."""
+    id: uuid.UUID
+    name: str
+    camera_code: str
+    channel: Optional[int] = None
+    sort_order: int = 0
+    enabled: bool
+    status: CCTVCameraStatus
+    last_seen_at: Optional[datetime] = None
+    last_error: Optional[str] = None
+
+
+class BuildingResponse(BaseModel):
+    """Safe building view. Camera counts are derived from camera rows. Infrastructure fields (owner contact, IPs, networks, recorder host) are set only for admins."""
+    id: uuid.UUID
+    name: str
+    code: str
+    owner_name: Optional[str] = None
+    owner_contact: Optional[str] = None
+    zone: Optional[str] = None
+    address: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    public_ip: Optional[str] = None
+    connection_mode: CCTVConnectionMode
+    network_access: CCTVNetworkAccess
+    authorized_networks: List[str] = Field(default_factory=list)
+    recorder_vendor: CCTVVendorPreset
+    recorder_protocol: CCTVStreamProtocol
+    recorder_host: Optional[str] = None
+    recorder_port: Optional[int] = None
+    stream_path_template: Optional[str] = None
+    recorder_username: Optional[str] = None
+    recorder_credentials_configured: bool = False
+    enabled: bool
+    camera_count: int = 0
+    enabled_camera_count: int = 0
+    online_count: int = 0
+    offline_count: int = 0
+    health: Literal["online", "degraded", "offline", "unknown", "empty", "disabled"] = "unknown"
+    created_at: datetime
+    updated_at: datetime
+
+
+class BuildingDetailResponse(BuildingResponse):
+    cameras: List[BuildingCameraBrief] = Field(default_factory=list)
+
+
+class BuildingListResponse(BaseModel):
+    items: List[BuildingDetailResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+class CameraAssignRequest(BaseModel):
+    """Assign an existing camera to a building (or detach with building_id=null)."""
+    building_id: Optional[uuid.UUID] = None
+    channel: Optional[int] = Field(default=None, ge=1, le=512)
+    sort_order: Optional[int] = Field(default=None, ge=0, le=10000)
+
+
+class CameraReorderRequest(BaseModel):
+    camera_ids: List[uuid.UUID] = Field(..., min_length=1, max_length=256)
+
+
+class CCTVHealthRunResponse(BaseModel):
+    cameras_checked: int
+    targets_probed: int
+    status_changes: int
+    skipped_not_due: int
+
+
+class BuildingTestTarget(BaseModel):
+    """One probed endpoint of a building: the NVR itself, or one direct-IP camera. Error text is sanitised (no addresses)."""
+    target: str
+    status: CCTVCameraStatus
+    latency_ms: Optional[float] = None
+    error: Optional[str] = None
+    camera_ids: List[uuid.UUID] = Field(default_factory=list)
+
+
+class BuildingTestResponse(BaseModel):
+    building_id: uuid.UUID
+    results: List[BuildingTestTarget]
 
 
 # ---------------------------------------------------------------------------
@@ -707,7 +1205,60 @@ class CCTVStreamStartResponse(BaseModel):
 # through.
 # ---------------------------------------------------------------------------
 
-class AccessPointCreateRequest(BaseModel):
+_BSSID_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
+def normalise_bssid(value: Optional[str]) -> Optional[str]:
+    """aa:bb:cc:dd:ee:ff (lower-case). Rejects malformed, all-zero, broadcast and multicast addresses -- none can be a real AP radio."""
+    if value is None:
+        return None
+    raw = re.sub(r"[:\-.]", "", value.strip().lower())
+    if not _BSSID_RE.match(raw):
+        raise ValueError("BSSID must be a 48-bit MAC address such as aa:bb:cc:dd:ee:ff")
+    if raw == "000000000000" or raw == "ffffffffffff":
+        raise ValueError("BSSID cannot be the all-zero or broadcast address")
+    if int(raw[1], 16) & 1:
+        raise ValueError("BSSID cannot be a multicast address")
+    return ":".join(raw[i:i + 2] for i in range(0, 12, 2))
+
+
+class _AccessPointInventoryFields(BaseModel):
+    manufacturer: Optional[str] = Field(default=None, max_length=64)
+    model: Optional[str] = Field(default=None, max_length=64)
+    serial_number: Optional[str] = Field(default=None, max_length=128)
+    bssid: Optional[str] = None
+    ssid: Optional[str] = Field(default=None, min_length=1, max_length=32)
+    management_ip: Optional[str] = None
+    controller_source: Optional[str] = Field(default=None, max_length=128)
+    building: Optional[str] = Field(default=None, max_length=128)
+    floor: Optional[str] = Field(default=None, max_length=32)
+    event_zone_codes: Optional[List[str]] = None
+
+    @field_validator("bssid")
+    @classmethod
+    def _check_bssid(cls, v):
+        return normalise_bssid(v) if v not in (None, "") else None
+
+    @field_validator("management_ip")
+    @classmethod
+    def _check_ip(cls, v):
+        if v in (None, ""):
+            return None
+        try:
+            return str(ipaddress.ip_address(v.strip()))
+        except ValueError:
+            raise ValueError("management_ip must be a valid IPv4/IPv6 address")
+
+    @field_validator("manufacturer", "model", "serial_number", "ssid", "controller_source", "building", "floor")
+    @classmethod
+    def _blank_to_none(cls, v):
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
+
+class AccessPointCreateRequest(_AccessPointInventoryFields):
     code: str = Field(..., min_length=1, max_length=32)
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = Field(default=None, max_length=1000)
@@ -721,7 +1272,7 @@ class AccessPointCreateRequest(BaseModel):
     is_demo: bool = False
 
 
-class AccessPointUpdateRequest(BaseModel):
+class AccessPointUpdateRequest(_AccessPointInventoryFields):
     """All fields optional -- only the ones provided are changed. `code` is not updatable here (stable natural key, same convention as Device.device_identifier / CCTVCamera.camera_code)."""
     name: Optional[str] = Field(default=None, min_length=1, max_length=255)
     description: Optional[str] = Field(default=None, max_length=1000)
@@ -733,6 +1284,17 @@ class AccessPointUpdateRequest(BaseModel):
     coverage_radius_m: Optional[float] = Field(default=None, gt=0)
     edge_node_id: Optional[str] = Field(default=None, max_length=128)
     is_demo: Optional[bool] = None
+
+
+class AccessPointRetireRequest(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=500)
+
+
+class APConfigChangeResponse(BaseModel):
+    at: datetime
+    by: Optional[uuid.UUID] = None
+    action: str
+    changes: dict = Field(default_factory=dict)
 
 
 class AccessPointResponse(BaseModel):
@@ -747,8 +1309,33 @@ class AccessPointResponse(BaseModel):
     longitude: Optional[float] = None
     coverage_radius_m: Optional[float] = None
     edge_node_id: Optional[str] = None
+    manufacturer: Optional[str] = None
+    model: Optional[str] = None
+    serial_number: Optional[str] = None
+    bssid: Optional[str] = None
+    ssid: Optional[str] = None
+    management_ip: Optional[str] = None
+    controller_source: Optional[str] = None
+    building: Optional[str] = None
+    floor: Optional[str] = None
+    event_zone_codes: List[str] = Field(default_factory=list)
     enabled: bool
+    lifecycle_status: APLifecycleStatus = APLifecycleStatus.active
+    # Administrative record state vs. real-world proof, kept strictly apart:
+    verification_status: APVerificationStatus = APVerificationStatus.registered
+    verification_source: Optional[str] = None
+    verified_at: Optional[datetime] = None
+    last_verification_attempt_at: Optional[datetime] = None
+    last_verification_error: Optional[str] = None
+    last_seen_at: Optional[datetime] = None
+    integration_health: APIntegrationHealth = APIntegrationHealth.unconfigured
+    # DERIVED, never stored as an admin claim: "reachable"/"unreachable" only
+    # for a verified AP with telemetry; "unknown" for everything else.
+    reachability: str = "unknown"
+    # Legacy field kept for existing clients; mirrors `reachability` (online/offline/unknown).
     status: AccessPointStatus
+    retired_at: Optional[datetime] = None
+    retire_reason: Optional[str] = None
     is_demo: bool
     created_at: datetime
     updated_at: datetime
@@ -756,6 +1343,13 @@ class AccessPointResponse(BaseModel):
     # scan current presence rows to answer "how many officers are here" --
     # left unset (None) on single-camera-style reads that don't compute it.
     associated_device_count: Optional[int] = None
+    config_history: Optional[List[APConfigChangeResponse]] = None
+
+
+class APIntegrationStatusResponse(BaseModel):
+    configured: bool
+    kind: Optional[str] = None
+    message: str
 
 
 class PresenceAssociationRequest(BaseModel):
@@ -901,3 +1495,98 @@ class ZoneAlertResponse(BaseModel):
     message: str
     targeted_constable_ids: List[uuid.UUID]
     targeted_device_count: int
+
+
+# ---------------------------------------------------------------------------
+# Geographic Event Zones (Task 1)
+# ---------------------------------------------------------------------------
+
+class EventZoneCreateRequest(BaseModel):
+    code: str = Field(..., min_length=2, max_length=64)
+    name: str = Field(..., min_length=2, max_length=255)
+    description: Optional[str] = None
+    deployment: Optional[str] = None
+    zone_type: ZoneType = ZoneType.security
+    # coordinates must be a GeoJSON polygon ring list: [[[lon, lat], ...]]
+    coordinates: List[List[List[float]]]
+    priority: int = 0
+    color: Optional[str] = "#3B82F6"
+    enabled: bool = True
+
+
+class EventZoneUpdateRequest(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=2, max_length=255)
+    description: Optional[str] = None
+    deployment: Optional[str] = None
+    zone_type: Optional[ZoneType] = None
+    coordinates: Optional[List[List[List[float]]]] = None
+    priority: Optional[int] = None
+    color: Optional[str] = None
+    enabled: Optional[bool] = None
+
+
+class EventZoneResponse(BaseModel):
+    id: uuid.UUID
+    code: str
+    name: str
+    description: Optional[str] = None
+    deployment: Optional[str] = None
+    zone_type: ZoneType
+    coordinates: List[List[List[float]]]
+    # The same boundary as a GeoJSON Polygon object ({"type","coordinates"}),
+    # so map clients can consume it directly.
+    polygon: Optional[dict] = None
+    priority: int
+    color: Optional[str] = None
+    enabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Physical Edge AP Telemetry Ingestion (Task 2)
+# ---------------------------------------------------------------------------
+
+class EdgeAPEventType(str, enum.Enum):
+    association = "association"
+    disassociation = "disassociation"
+    roam = "roam"
+
+
+class EdgeAPTelemetryEventRequest(BaseModel):
+    controller_event_id: str = Field(..., min_length=1, max_length=128)
+    controller_id: str = Field(..., min_length=1, max_length=64)
+    ap_code: Optional[str] = None
+    ap_bssid: Optional[str] = None
+    event_type: EdgeAPEventType = EdgeAPEventType.association
+    occurred_at: datetime
+    device_identifier: Optional[str] = None
+    authenticated_identity: Optional[str] = None
+    station_mac: Optional[str] = None
+    ssid: Optional[str] = None
+    rssi_dbm: Optional[int] = None
+    source_metadata: Optional[dict] = None
+
+
+class EdgeAPTelemetryBatchRequest(BaseModel):
+    events: List[EdgeAPTelemetryEventRequest] = Field(..., min_length=1, max_length=50)
+
+
+class EdgeAPTelemetryResponse(BaseModel):
+    status: str  # "accepted", "duplicate_ignored", "unmapped_device", "disassociated"
+    event_id: str
+    processed_at: datetime
+    handoff_created: bool = False
+    device_identifier: Optional[str] = None
+    access_point_code: Optional[str] = None
+    message: Optional[str] = None
+
+
+class EdgeAPTelemetryBatchResponse(BaseModel):
+    total: int
+    accepted: int
+    duplicate: int
+    unmapped: int
+    errors: int
+    results: List[EdgeAPTelemetryResponse]
+

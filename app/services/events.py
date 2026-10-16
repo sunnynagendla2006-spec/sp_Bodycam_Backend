@@ -23,6 +23,7 @@ WebSocket delivery problem can never raise up into the caller and can
 never affect whether the database transaction that triggered it commits.
 """
 import uuid
+from datetime import datetime
 from typing import Optional
 
 from .. import models
@@ -184,21 +185,113 @@ async def publish_constable_location_updated(
     latitude: float,
     longitude: float,
     accuracy: Optional[float],
+    device_id: Optional[uuid.UUID] = None,
+    recorded_at: Optional[datetime] = None,
+    server_received_at: Optional[datetime] = None,
+    sequence_number: Optional[int] = None,
+    geographic_zone: Optional[str] = None,
+    zone_status: Optional[str] = None,
+    source: str = "GNSS",
+    duty_session_id: Optional[uuid.UUID] = None,
+    buffered: bool = False,
+    assigned_zone: Optional[str] = None,
 ):
     """
     Goes to control_room + the constable's OWN station only -- never to any
     other constable. This is the one event type explicitly called out in
     Part 9 as never-broadcast-globally.
+
+    Published ONLY when an officer's position genuinely advanced (a newer
+    fix than the one already held) -- never for duplicates or late history,
+    so a marker can only move because real new coordinates arrived. Clients
+    must derive live/delayed/stale from `recorded_at`, not receipt time.
     """
     payload = {
         "constable_id": str(constable_id),
         "latitude": latitude,
         "longitude": longitude,
         "accuracy": accuracy,
+        "device_id": str(device_id) if device_id else None,
+        "recorded_at": recorded_at.isoformat() if recorded_at else None,
+        "server_received_at": server_received_at.isoformat() if server_received_at else None,
+        "sequence_number": sequence_number,
+        "geographic_zone": geographic_zone,
+        "zone_status": zone_status,
+        "source": source,
+        "duty_session_id": str(duty_session_id) if duty_session_id else None,
+        "buffered": buffered,
+        "assigned_zone": assigned_zone,
     }
     event = build_event("constable.location_updated", payload)
     await manager.send_to_control_room(event)
     await manager.send_to_station(station_id, event)
+
+
+async def publish_event_zone_changed(action: str, zone_id: uuid.UUID, code: str):
+    """Boundary/metadata of a geographic zone changed -- map clients refetch zones. control_room + all stations."""
+    event = build_event(f"event_zone.{action}", {"zone_id": str(zone_id), "code": code})
+    await manager.send_to_control_room(event)
+
+
+async def publish_constable_duty_changed(
+    constable_id: uuid.UUID,
+    station_id: Optional[uuid.UUID],
+    on_duty: bool,
+    duty_session_id: Optional[uuid.UUID] = None,
+    reason: Optional[str] = None,
+):
+    """Duty (tracking authorisation) started or ended. control_room + the officer's station."""
+    event = build_event("constable.duty_changed", {
+        "constable_id": str(constable_id),
+        "on_duty": on_duty,
+        "duty_session_id": str(duty_session_id) if duty_session_id else None,
+        "reason": reason,
+    })
+    await manager.send_to_control_room(event)
+    await manager.send_to_station(station_id, event)
+
+
+async def publish_constable_assignment_changed(
+    constable_id: uuid.UUID,
+    station_id: Optional[uuid.UUID],
+    assigned_zone_code: Optional[str],
+):
+    """An officer's ASSIGNED duty zone changed (administrative; independent of the detected zone)."""
+    event = build_event("constable.assignment_changed", {
+        "constable_id": str(constable_id),
+        "assigned_zone": assigned_zone_code,
+    })
+    await manager.send_to_control_room(event)
+    await manager.send_to_station(station_id, event)
+
+
+async def publish_constable_zone_changed(
+    constable_id: uuid.UUID,
+    station_id: Optional[uuid.UUID],
+    previous_zone: Optional[str],
+    current_zone: Optional[str],
+    latitude: float,
+    longitude: float,
+    timestamp: datetime,
+    zone_status: str = "CONFIRMED",
+):
+    """
+    Published when an officer's accepted geographic zone boundary transition occurs.
+    Sent to control_room and the constable's own station.
+    """
+    payload = {
+        "constable_id": str(constable_id),
+        "previous_zone": previous_zone,
+        "current_zone": current_zone,
+        "latitude": latitude,
+        "longitude": longitude,
+        "timestamp": timestamp.isoformat(),
+        "zone_status": zone_status,
+    }
+    event = build_event("constable.zone_changed", payload)
+    await manager.send_to_control_room(event)
+    await manager.send_to_station(station_id, event)
+
 
 
 # ---------------------------------------------------------------------------
@@ -308,9 +401,23 @@ def _recording_summary(session: models.RecordingSession) -> dict:
     }
 
 
+async def _to_control_room_for_recording(session: models.RecordingSession, event: dict):
+    """Recording events of a SITE recording reach only the control-room users who may view that site (restricted sites
+    included), the same policy as the REST endpoints. Recordings without a site keep the original broadcast."""
+    from . import site_access  # imported here, as elsewhere in this module, to avoid an import cycle
+
+    site_id = getattr(session, "site_id", None)
+    if site_id is not None:
+        site = await models.MonitoredSite.get(site_id)
+        if site is not None:
+            await manager.send_to_control_room_where(event, site_access.ws_predicate(site))
+            return
+    await manager.send_to_control_room(event)
+
+
 async def publish_recording_started(session: models.RecordingSession, station_id: Optional[uuid.UUID]):
     event = build_event("recording.started", _recording_summary(session))
-    await manager.send_to_control_room(event)
+    await _to_control_room_for_recording(session, event)
     await manager.send_to_station(station_id, event)
     await manager.send_to_constable(session.constable_id, event)
 
@@ -320,7 +427,7 @@ async def publish_recording_chunk_uploaded(session: models.RecordingSession, sta
     payload["chunk_number"] = chunk_number
     payload["is_last_chunk"] = is_last_chunk
     event = build_event("recording.chunk_uploaded", payload)
-    await manager.send_to_control_room(event)
+    await _to_control_room_for_recording(session, event)
     await manager.send_to_station(station_id, event)
     await manager.send_to_constable(session.constable_id, event)
 
@@ -329,14 +436,14 @@ async def publish_recording_completed(session: models.RecordingSession, station_
     payload = _recording_summary(session)
     payload["missing_chunk_numbers"] = missing_chunk_numbers
     event = build_event("recording.completed", payload)
-    await manager.send_to_control_room(event)
+    await _to_control_room_for_recording(session, event)
     await manager.send_to_station(station_id, event)
     await manager.send_to_constable(session.constable_id, event)
 
 
 async def publish_recording_cancelled(session: models.RecordingSession, station_id: Optional[uuid.UUID]):
     event = build_event("recording.cancelled", _recording_summary(session))
-    await manager.send_to_control_room(event)
+    await _to_control_room_for_recording(session, event)
     await manager.send_to_station(station_id, event)
     await manager.send_to_constable(session.constable_id, event)
 
@@ -346,7 +453,7 @@ async def publish_recording_failed(session: models.RecordingSession, station_id:
     if reason:
         payload["reason"] = reason
     event = build_event("recording.failed", payload)
-    await manager.send_to_control_room(event)
+    await _to_control_room_for_recording(session, event)
     await manager.send_to_station(station_id, event)
     await manager.send_to_constable(session.constable_id, event)
 
@@ -461,6 +568,7 @@ def _cctv_camera_summary(camera: models.CCTVCamera) -> dict:
         "station_id": str(camera.station_id) if camera.station_id else None,
         "enabled": camera.enabled,
         "status": camera.status.value if camera.status else None,
+        "building_id": str(camera.building_id) if camera.building_id else None,
     }
 
 
@@ -620,3 +728,51 @@ async def publish_zone_emergency_alert(
     await manager.send_to_control_room(build_event("zone.emergency_alert", payload))
     for constable_id in targeted_constable_ids:
         await manager.send_to_constable(constable_id, build_event("zone.emergency_alert", {"zone": zone, "message": message}))
+
+
+# ---------------------------------------------------------------------------
+# CCTV buildings. Same audience and no-secrets rule as the camera events above:
+# control_room room only, and payloads never carry hosts, IPs or credentials.
+# ---------------------------------------------------------------------------
+
+async def publish_cctv_building_changed(building: models.Building, kind: str):
+    """kind: created | updated | enabled | disabled | deleted"""
+    await manager.send_to_control_room(build_event(f"cctv.building_{kind}", {
+        "building_id": str(building.id), "code": building.code, "name": building.name,
+        "zone": building.zone, "enabled": building.enabled,
+    }))
+
+
+async def publish_cctv_building_health(building_id: uuid.UUID, health: str, counts: dict):
+    await manager.send_to_control_room(build_event("cctv.building_health", {
+        "building_id": str(building_id), "health": health, **counts,
+    }))
+
+
+# ---------------------------------------------------------------------------
+# Network monitoring (generic sites). Site-scoped: delivered only to the
+# control-room users allowed to open that site (services/site_access.py), and
+# AGGREGATE ONLY -- no client pseudonym, MAC or per-client detail is ever put
+# on the WebSocket.
+# ---------------------------------------------------------------------------
+
+async def _publish_site_event(site: models.MonitoredSite, name: str, payload: dict):
+    from . import site_access
+
+    await manager.send_to_control_room_where(build_event(name, {"site_id": str(site.id), "site_code": site.code, **payload}), site_access.ws_predicate(site))
+
+
+async def publish_network_counts(site: models.MonitoredSite, payload: dict):
+    await _publish_site_event(site, "network.counts", payload)
+
+
+async def publish_network_roam(site: models.MonitoredSite, payload: dict):
+    await _publish_site_event(site, "network.roam", payload)
+
+
+async def publish_network_breach(site: models.MonitoredSite, payload: dict):
+    await _publish_site_event(site, "network.breach", payload)
+
+
+async def publish_network_health(site: models.MonitoredSite, payload: dict):
+    await _publish_site_event(site, "network.health", payload)

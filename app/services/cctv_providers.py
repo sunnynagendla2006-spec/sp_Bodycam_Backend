@@ -9,8 +9,10 @@ legend):
     (against a local fake TCP server in tests/test_cctv_providers.py)
     [RUNTIME VERIFIED: NO] [PHYSICAL CAMERA VERIFIED: NO] -- no real RTSP
     camera or NVR was reachable in this environment.
-  - RTSPProvider.start_stream(): [IMPLEMENTED: NO] -- see its docstring.
-    This is a real extension point, not a disguised fake success path.
+  - RTSPProvider.start_stream(): [IMPLEMENTED] -- registers an on-demand
+    path on the MediaMTX gateway (services/cctv_gateway.py). Returns ok=False
+    with an honest error when no gateway is configured or reachable; never a
+    fabricated success. [RUNTIME VERIFIED: NO] -- no gateway/camera available.
   - ONVIFProvider.validate_connection(): [IMPLEMENTED] -- a genuine ONVIF
     SOAP probe (GetSystemDateAndTime, the one ONVIF device-service call
     that never requires authentication), not a placeholder. [UNIT TESTED]
@@ -19,8 +21,8 @@ legend):
     -- no physical ONVIF device exists in this environment, so a real
     probe against this project's own demo camera honestly reports "not a
     valid ONVIF response", never a fabricated "online".
-  - ONVIFProvider.start_stream(): [IMPLEMENTED: NO] -- same honest
-    "no media gateway" extension point as RTSPProvider.start_stream().
+  - ONVIFProvider.start_stream(): [IMPLEMENTED] -- same gateway path as
+    RTSP (the media itself is always pulled over RTSP).
   - NVR / VMS providers: [NOT IMPLEMENTED] -- placeholders that raise
     NotImplementedError with a clear message. Do not wire these into any
     endpoint as if they worked.
@@ -36,7 +38,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from .. import models
-from . import cctv_security
+from . import cctv_gateway, cctv_playback, cctv_security
 
 _RTSP_CONNECT_TIMEOUT_SECONDS = float(os.getenv("CCTV_RTSP_CONNECT_TIMEOUT_SECONDS", "5"))
 
@@ -58,6 +60,15 @@ class CCTVStreamStartResult:
     token: Optional[str] = None
     identity: Optional[str] = None
     error: Optional[str] = None
+
+
+async def _start_via_gateway(camera: "models.CCTVCamera") -> CCTVStreamStartResult:
+    """Shared by RTSP and ONVIF cameras: media is pulled over RTSP by the MediaMTX gateway. Returns ok=False (never raises) with an operator-safe reason."""
+    try:
+        name = await cctv_playback.prepare_path(camera)
+    except cctv_playback.PlaybackError as exc:
+        return CCTVStreamStartResult(ok=False, error=exc.message)
+    return CCTVStreamStartResult(ok=True, gateway="mediamtx", stream_reference=name)
 
 
 class CCTVProvider(abc.ABC):
@@ -157,14 +168,12 @@ class RTSPProvider(CCTVProvider):
         )
 
     async def start_stream(self, camera: "models.CCTVCamera", session: "models.CCTVStreamSession") -> CCTVStreamStartResult:
-        return CCTVStreamStartResult(
-            ok=False,
-            error=(
-                "Media bridging (WebRTC/HLS) is not implemented in this phase. "
-                "Camera management, connectivity testing, status, and nearby-camera "
-                "search are fully functional without it."
-            ),
-        )
+        return await _start_via_gateway(camera)
+
+    async def stop_stream(self, camera: "models.CCTVCamera", session: "models.CCTVStreamSession") -> None:
+        # On-demand paths close themselves after the last viewer leaves; dropping the path
+        # now also ends any remaining viewers and forgets the credential-bearing source.
+        await cctv_playback.release_path(camera.id)
 
 
 _ONVIF_SOAP_NS = {"soap": "http://www.w3.org/2003/05/soap-envelope"}
@@ -260,10 +269,10 @@ class ONVIFProvider(CCTVProvider):
         return CCTVConnectionResult(status=models.CCTVCameraStatus.degraded, latency_ms=latency_ms, error="responded, but not with a recognizable ONVIF GetSystemDateAndTime response")
 
     async def start_stream(self, camera: "models.CCTVCamera", session: "models.CCTVStreamSession") -> CCTVStreamStartResult:
-        return CCTVStreamStartResult(
-            ok=False,
-            error="Media bridging (WebRTC/HLS) is not implemented in this phase, same as the generic RTSP provider.",
-        )
+        return await _start_via_gateway(camera)
+
+    async def stop_stream(self, camera: "models.CCTVCamera", session: "models.CCTVStreamSession") -> None:
+        await cctv_playback.release_path(camera.id)
 
 
 class _UnimplementedProvider(CCTVProvider):

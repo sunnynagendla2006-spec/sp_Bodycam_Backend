@@ -12,11 +12,13 @@ environment variables, never to a destination an admin enters through the
 API. That makes this the one place in the codebase that needs real SSRF
 handling.
 """
+import contextlib
+import contextvars
 import ipaddress
 import os
 import socket
 import warnings
-from typing import List
+from typing import Iterable, List, Optional
 
 from cryptography.fernet import Fernet
 
@@ -112,13 +114,58 @@ def get_allowed_networks() -> List:
     return _allowed_networks()
 
 
-def validate_stream_target(host: str, port: int) -> None:
+# Per-building authorization (see models.Building.authorized_networks). The
+# global CCTV_ALLOWED_NETWORKS allowlist stays in force and is never widened
+# for other callers: a building's extra networks apply ONLY inside the
+# `extra_networks()` context of an operation on that building's cameras, and
+# the permanently blocked ranges below still win over everything.
+_extra_networks_var: contextvars.ContextVar = contextvars.ContextVar("cctv_extra_networks", default=())
+
+# Widest network an admin may authorize for a single building. A building
+# authorizing e.g. 0.0.0.0/0 would silently disable the SSRF policy.
+_MIN_IPV4_PREFIX = 16
+_MIN_IPV6_PREFIX = 48
+
+
+def parse_authorized_networks(values: Iterable[str]) -> List:
+    """Strictly parses admin-supplied CIDRs for a building. Raises ValueError (never skips silently, unlike the env parser) on a malformed, over-broad or permanently blocked entry."""
+    nets = []
+    for raw in values:
+        raw = (raw or "").strip()
+        if not raw:
+            continue
+        try:
+            net = ipaddress.ip_network(raw, strict=False)
+        except ValueError:
+            raise ValueError(f"'{raw}' is not a valid IP address or CIDR")
+        min_prefix = _MIN_IPV4_PREFIX if net.version == 4 else _MIN_IPV6_PREFIX
+        if net.prefixlen < min_prefix:
+            raise ValueError(f"'{raw}' is too broad; a building may authorize at most a /{min_prefix} network")
+        for blocked in _BLOCKED_ALWAYS:
+            if net.version == blocked.version and net.overlaps(blocked):
+                raise ValueError(f"'{raw}' overlaps a permanently blocked range")
+        nets.append(net)
+    return nets
+
+
+@contextlib.contextmanager
+def extra_networks(networks: Optional[Iterable]):
+    """Temporarily adds a building's already-parsed authorized networks to the allowlist for the current task only."""
+    token = _extra_networks_var.set(tuple(networks or ()))
+    try:
+        yield
+    finally:
+        _extra_networks_var.reset(token)
+
+
+def resolve_and_validate(host: str, port: int) -> List[str]:
     """
-    Raises ValueError (never returns a reason code -- callers always treat
-    this as "rejected") if `host:port` is not a permitted camera network
-    destination. Resolves the hostname and checks the RESOLVED address
-    (not just the string the client typed), so a DNS name that resolves to
-    a blocked/unlisted address is caught too, not just a literal IP.
+    Raises ValueError if `host:port` is not a permitted camera network
+    destination; otherwise returns the validated IP address strings the
+    host resolved to. Callers that hand the destination to ANOTHER process
+    (the media gateway) should connect to one of these literal addresses
+    rather than re-resolving the name, which closes the DNS-rebinding gap
+    between "checked here" and "connected there".
     """
     if not host or not isinstance(port, int) or not (1 <= port <= 65535):
         raise ValueError("invalid host/port")
@@ -128,17 +175,27 @@ def validate_stream_target(host: str, port: int) -> None:
     except socket.gaierror as exc:
         raise ValueError(f"could not resolve host '{host}': {exc}")
 
-    allowed = _allowed_networks()
+    allowed = _allowed_networks() + list(_extra_networks_var.get())
     if not allowed:
         raise ValueError(
-            "CCTV_ALLOWED_NETWORKS is not configured -- refusing all camera "
-            "network targets (fail-closed; see .env.example)"
+            "CCTV_ALLOWED_NETWORKS is not configured and the building has no "
+            "authorized networks -- refusing all camera network targets "
+            "(fail-closed; see .env.example)"
         )
 
+    resolved: List[str] = []
     for _family, _type, _proto, _canon, sockaddr in infos:
         ip = ipaddress.ip_address(sockaddr[0])
         for blocked in _BLOCKED_ALWAYS:
             if ip in blocked:
                 raise ValueError(f"resolved address {ip} is in a permanently blocked range ({blocked})")
         if not any(ip in net for net in allowed):
-            raise ValueError(f"resolved address {ip} is not within any CCTV_ALLOWED_NETWORKS entry")
+            raise ValueError(f"resolved address {ip} is not within any authorized network")
+        if str(ip) not in resolved:
+            resolved.append(str(ip))
+    return resolved
+
+
+def validate_stream_target(host: str, port: int) -> None:
+    """Raises ValueError if `host:port` is not a permitted camera network destination. Resolves the hostname and checks the RESOLVED address(es), so a DNS name pointing at a blocked/unlisted address is caught too. See resolve_and_validate()."""
+    resolve_and_validate(host, port)

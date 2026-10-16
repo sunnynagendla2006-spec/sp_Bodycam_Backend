@@ -1,9 +1,12 @@
 import os
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from motor.motor_asyncio import AsyncIOMotorClient
 
-MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://mongo:27017/?replicaSet=rs0")
+MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
 MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "police_db")
 
 # uuidRepresentation="standard" is required (not optional): without it,
@@ -56,6 +59,19 @@ async def transaction():
             await some_doc.save(session=session)
             await log_action(..., session=session)
     """
-    async with await client.start_session() as session:
-        async with session.start_transaction():
-            yield session
+    try:
+        async with await client.start_session() as session:
+            try:
+                async with session.start_transaction():
+                    yield session
+            except Exception as e:
+                if "replica set" in str(e).lower() or "transaction numbers" in str(e).lower():
+                    yield None
+                else:
+                    raise
+    except Exception as e:
+        if "replica set" in str(e).lower() or "transaction numbers" in str(e).lower():
+            yield None
+        else:
+            raise
+

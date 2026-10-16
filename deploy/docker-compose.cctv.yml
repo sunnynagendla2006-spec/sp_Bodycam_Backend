@@ -1,0 +1,38 @@
+# CCTV media gateway (MediaMTX) for SP Bodycam.
+#
+# NOT STARTED OR VERIFIED by the implementation work: an operator runs this.
+# See docs/CCTV_BUILDINGS_AND_GATEWAY.md for prerequisites (VPN/tunnel to the
+# buildings, TLS reverse proxy, firewall rules).
+#
+#   docker compose -f deploy/docker-compose.cctv.yml --env-file deploy/cctv.env up -d
+#
+# Required environment (put them in deploy/cctv.env; do NOT commit real values):
+#   CCTV_GATEWAY_AUTH_URL     e.g. http://backend:8000/cctv/gateway/auth?key=<CCTV_GATEWAY_AUTH_KEY>
+#   CCTV_GATEWAY_PUBLIC_HOST  public IP/DNS name browsers use to reach WebRTC media
+#   BACKEND_NETWORK           name of the docker network the backend runs on
+#
+# The control API (9997) is deliberately NOT published: the backend reaches it as
+# http://mediamtx:9997 over the shared network, so set on the backend:
+#   CCTV_GATEWAY_API_URL=http://mediamtx:9997
+#   CCTV_GATEWAY_PUBLIC_URL=https://<your TLS front for port 8889>
+
+services:
+  mediamtx:
+    # Pinned on purpose: config option names change between releases.
+    image: bluenviron/mediamtx:1.9.3
+    restart: unless-stopped
+    volumes:
+      - ./mediamtx/mediamtx.yml:/mediamtx.yml:ro
+    environment:
+      MTX_AUTHHTTPADDRESS: ${CCTV_GATEWAY_AUTH_URL:?set CCTV_GATEWAY_AUTH_URL}
+      MTX_WEBRTCADDITIONALHOSTS: ${CCTV_GATEWAY_PUBLIC_HOST:?set CCTV_GATEWAY_PUBLIC_HOST}
+    ports:
+      - "8889:8889"        # WHEP/HTTP -- put a TLS reverse proxy in front for production
+      - "8189:8189/udp"    # WebRTC media (ICE/UDP)
+    networks:
+      - backend
+
+networks:
+  backend:
+    name: ${BACKEND_NETWORK:?set BACKEND_NETWORK}
+    external: true

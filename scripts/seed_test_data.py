@@ -37,8 +37,9 @@ from app.database import init_db
 from app.geo import point
 from app.models import User, UserRole, UserStatus, Constable, ConstableStatus, PoliceStation, Device, DeviceStatus
 from app.auth.security import hash_password
+from app.auth.seed_guard import seed_password
 
-TEST_PASSWORD = "Demo@12345"  # matches seed_demo.py's existing test-environment convention
+TEST_PASSWORD = seed_password()  # from SEED_PASSWORD or generated per run -- never hardcoded
 
 STATIONS = [
     {"name": "Test Control Station", "longitude": 78.4500, "latitude": 17.4300},
@@ -121,7 +122,7 @@ async def seed():
             await device.save()
             print(f"updated device association: {device_identifier} -> {badge}")
 
-    print(f"\nTest data seeded. Password for all 5 test constables: {TEST_PASSWORD}")
+    print("\nTest data seeded. All 5 test constables use the seed password shown above (SEED_PASSWORD).")
 
 
 async def reset():

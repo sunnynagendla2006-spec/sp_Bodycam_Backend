@@ -3,6 +3,7 @@ import asyncio
 from app.database import init_db
 from app.models import User, UserRole, UserStatus
 from app.auth.security import hash_password
+from app.auth.seed_guard import seed_password
 
 
 async def seed():
@@ -16,7 +17,7 @@ async def seed():
         {"phone": "9990001005", "role": UserRole.citizen},
     ]
 
-    hashed_pwd = hash_password("Demo@12345")
+    hashed_pwd = hash_password(seed_password())
 
     for u in users:
         existing = await User.find_one(User.phone == u["phone"])

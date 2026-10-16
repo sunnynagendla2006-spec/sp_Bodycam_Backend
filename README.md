@@ -46,7 +46,7 @@ AUTHORIZED CAMERA (admin-registered only)
         v
   CCTVCamera.status (online/offline/degraded/unknown/disabled)
 
-Browser-viewable streaming (WebRTC/HLS bridge): [NOT IMPLEMENTED]
+Browser-viewable streaming (WebRTC via MediaMTX): [IMPLEMENTED, NOT RUNTIME VERIFIED -- see docs/CCTV_BUILDINGS_AND_GATEWAY.md]
   -- see "Streaming" below.
 ```
 
@@ -324,8 +324,7 @@ to any other constable. [IMPLEMENTED] [UNIT TESTED] —
 creates the "DEMO JATARA ZONE" deployment: four `AccessPoint`s
 (`AP-01` Main Gate, `AP-02` Temple Area, `AP-03` Parking Area, `AP-04`
 Food Area, all `is_demo=True`) plus one demo constable/device (badge
-`POL-023`, device `DEV-023`, phone `9990003023`, password
-`Demo@12345`). Coordinates are synthetic and do not correspond to a
+`POL-023`, device `DEV-023`, phone `9990003023`; password supplied via `SEED_PASSWORD` or generated per run). Coordinates are synthetic and do not correspond to a
 real location. Safe to run repeatedly; matched by natural key
 (`AccessPoint.code` / `User.phone` / `Device.device_identifier`), never
 duplicated, and never collides with `seed_demo.py` or

@@ -26,13 +26,16 @@ from fastapi.security import HTTPAuthorizationCredentials
 from jose import JWTError
 from pymongo import ReturnDocument
 
-from beanie.operators import In
+from beanie.operators import In, NotIn
+from pymongo.errors import DuplicateKeyError
 
 from .. import models, schemas
 from ..auth.deps import bearer_scheme, get_current_user, require_role
 from ..auth.security import decode_access_token
 from ..services.audit import log_action
 from ..services import events
+from ..services import evidence as evidence_service
+from ..services import site_access
 from ..services import chunk_manifest as chunk_manifest_service
 from ..services import storage as storage_service
 from . import media as media_module
@@ -48,9 +51,12 @@ def _utcnow():
     return datetime.datetime.now(datetime.timezone.utc)
 
 
-def _build_chunk_storage_key(recording_session_id: uuid.UUID, chunk_number: int, mime_type: str) -> str:
+def _build_chunk_storage_key(recording_session_id: uuid.UUID, chunk_number: int, mime_type: str, token: Optional[str] = None) -> str:
+    """With `token` (one per ingest request) the key is unique to that request: two racing uploads of the same chunk can never
+    write to, or delete, each other's object. Without it the legacy number-only key is produced (kept for old callers)."""
     ext = media_module.ALLOWED_MIME_TO_EXT.get(mime_type, "")
-    return f"recordings/{recording_session_id}/chunk_{chunk_number:06d}{ext}"
+    suffix = f"_{token}" if token else ""
+    return f"recordings/{recording_session_id}/chunk_{chunk_number:06d}{suffix}{ext}"
 
 
 _WATERMARK_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -191,6 +197,10 @@ def _to_recording_response(session: models.RecordingSession) -> schemas.Recordin
         missing_chunk_numbers=summary.missing_chunk_numbers,
         playable_status=session.playable_status,
         camera_lens_direction=session.camera_lens_direction,
+        site_id=session.site_id,
+        receiver_id=session.receiver_id,
+        origin=session.origin,
+        flags=list(session.flags or []),
     )
 
 
@@ -202,7 +212,14 @@ async def _authorize_recording_access(session: models.RecordingSession, current_
     citizen: never.
     """
     role = current_user.role
-    if role in (models.UserRole.admin, models.UserRole.control_room):
+    if role == models.UserRole.admin:
+        return True
+    if role == models.UserRole.control_room:
+        # A recording made at a RESTRICTED site is visible only to the control-room users listed for that site.
+        if session.site_id is not None:
+            site = await models.MonitoredSite.get(session.site_id)
+            if site is not None and not site_access.can_view_user(site, current_user):
+                return False
         return True
     if role == models.UserRole.station:
         if not current_user.station_id:
@@ -249,7 +266,26 @@ async def start_recording(
     if camera_lens_direction not in ("front", "back"):
         raise HTTPException(status_code=422, detail="camera_lens_direction must be 'front' or 'back'")
 
+    site_id = None
+    if payload.site_id is not None:
+        # A recording may only be stamped with a site the officer is actively assigned to (never a client-claimed one).
+        assignment = await models.SiteAssignment.find_one({"site_id": payload.site_id, "constable_id": own_constable.id, "status": "active"})
+        if assignment is None:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="The officer is not assigned to that site")
+        site_id = payload.site_id
+
+    if payload.recording_id is not None:
+        # Idempotent start for a CLIENT-generated id: a retry (or a recording that already reached us via a site
+        # receiver) returns the same record; an id owned by someone else is refused.
+        existing = await models.RecordingSession.get(payload.recording_id)
+        if existing is not None:
+            if existing.constable_id != own_constable.id or existing.device_id != device.id:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="That recording id belongs to a different officer or device", headers={"X-Conflict-Reason": "recording_id_conflict"})
+            return _to_recording_response(existing)
+
     session = models.RecordingSession(
+        **({"id": payload.recording_id} if payload.recording_id is not None else {}),
+        site_id=site_id,
         constable_id=own_constable.id,
         device_id=device.id,
         trigger_type=payload.trigger_type,
@@ -257,9 +293,22 @@ async def start_recording(
         incident_id=payload.incident_id,
         camera_lens_direction=camera_lens_direction,
     )
-    await session.insert()
-    device.status = models.DeviceStatus.recording  # see devices.py::compute_effective_status for how this is surfaced
-    await device.save()
+    try:
+        await session.insert()
+    except DuplicateKeyError:
+        # Two identical starts raced past the read above. Only a client-supplied id can collide; answer idempotently
+        # for the same officer/device, refuse anything else.
+        if payload.recording_id is None:
+            raise
+        existing = await models.RecordingSession.get(payload.recording_id)
+        if existing is None or existing.constable_id != own_constable.id or existing.device_id != device.id:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="That recording id belongs to a different officer or device", headers={"X-Conflict-Reason": "recording_id_conflict"})
+        return _to_recording_response(existing)
+    if payload.recording_id is None:
+        # Legacy online flow: starting a recording is happening NOW, so the device is recording. A client-id (Network
+        # Hopping) registration may arrive long after the footage was captured and must not make the device look live.
+        device.status = models.DeviceStatus.recording  # see devices.py::compute_effective_status for how this is surfaced
+        await device.save()
 
     await log_action(
         user_id=current_user.id,
@@ -282,6 +331,11 @@ async def upload_chunk(
     latitude: Optional[float] = Form(None),
     longitude: Optional[float] = Form(None),
     recorded_at: Optional[str] = Form(None),
+    # Optional, backward compatible (older apps omit them): the phone's own chunk id, its SHA-256 of the captured bytes
+    # and the capture end time. When a hash is supplied it is VERIFIED and a mismatch is rejected.
+    chunk_id: Optional[str] = Form(None),
+    sha256: Optional[str] = Form(None),
+    captured_end: Optional[str] = Form(None),
     file: UploadFile = File(...),
     current_user: models.User = Depends(get_current_user),
 ):
@@ -307,7 +361,26 @@ async def upload_chunk(
     if chunk_number < 1:
         raise HTTPException(status_code=422, detail="chunk_number must be >= 1")
 
+    try:
+        declared_hash = evidence_service.normalize_sha256(sha256)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    parsed_chunk_id: Optional[uuid.UUID] = None
+    if chunk_id:
+        try:
+            parsed_chunk_id = uuid.UUID(chunk_id)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="chunk_id must be a UUID")
+
     # Fast-path duplicate check (not the genuine safety net -- see below).
+    prior = next((c for c in session.chunks if c.chunk_number == chunk_number), None)
+    if prior is not None and declared_hash and prior.original_hash and prior.original_hash != declared_hash:
+        # Same chunk number, DIFFERENT content: never silently treated as a duplicate.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Chunk {chunk_number} already exists with different content",
+            headers={"X-Conflict-Reason": "hash_conflict"},
+        )
     if any(c.chunk_number == chunk_number for c in session.chunks):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -327,7 +400,8 @@ async def upload_chunk(
     if resolved_mime not in media_module.ALLOWED_MIME_TO_EXT:
         raise HTTPException(status_code=400, detail=f"Unsupported chunk file type: {resolved_mime or 'unknown'}")
 
-    storage_key = _build_chunk_storage_key(recording_id, chunk_number, resolved_mime)
+    ingest_token = uuid.uuid4().hex[:16]  # ownership marker: this request alone writes (and, on failure, deletes) these keys
+    storage_key = _build_chunk_storage_key(recording_id, chunk_number, resolved_mime, ingest_token)
     storage = media_module._get_storage_backend()
 
     hasher = hashlib.sha256()
@@ -360,6 +434,22 @@ async def upload_chunk(
         raise
 
     file_hash = hasher.hexdigest()
+    if declared_hash and declared_hash != file_hash:
+        storage.delete(storage_key)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="The received chunk does not match the declared SHA-256 (corrupted in transit?). Upload it again.",
+            headers={"X-Conflict-Reason": "hash_mismatch"},
+        )
+    original_hash, original_size = file_hash, bytes_written
+
+    # Keep the captured bytes untouched: the watermark below rewrites storage_key in place, so a pristine copy is
+    # stored first (see services/evidence.py for the policy).
+    original_key = None
+    if evidence_service.preserve_enabled():
+        candidate = evidence_service.original_key_for(recording_id, chunk_number, os.path.splitext(storage_key)[1], ingest_token)
+        if evidence_service.preserve_original(storage, storage_key, candidate):
+            original_key = candidate
 
     parsed_recorded_at: Optional[datetime.datetime] = None
     if recorded_at:
@@ -368,18 +458,42 @@ async def upload_chunk(
         except ValueError:
             parsed_recorded_at = None  # malformed value from an old/buggy client -- never fatal, just omitted
 
-    burn_result = await _burn_watermark_best_effort(
-        storage=storage,
-        storage_key=storage_key,
-        session=session,
-        latitude=latitude,
-        longitude=longitude,
-        recorded_at=parsed_recorded_at,
-    )
+    # The watermark rewrites storage_key in place, so it is applied ONLY when a pristine copy of the original exists.
+    # If preservation is disabled or failed, the stored file stays exactly what the phone sent (no watermark).
+    burn_result = None
+    if original_key is not None:
+        burn_result = await _burn_watermark_best_effort(
+            storage=storage,
+            storage_key=storage_key,
+            session=session,
+            latitude=latitude,
+            longitude=longitude,
+            recorded_at=parsed_recorded_at,
+        )
+    processing = []
+    if original_key is None:
+        processing.append(evidence_service.provenance("watermark_skipped", "policy", original_hash, original_hash, reason="no preserved original"))
     if burn_result is not None:
         bytes_written, file_hash = burn_result
+        processing.append(evidence_service.provenance("watermark", "ffmpeg libx264 drawtext", original_hash, file_hash, preserved_original=original_key is not None))
+
+    parsed_captured_end: Optional[datetime.datetime] = None
+    if captured_end:
+        try:
+            parsed_captured_end = datetime.datetime.fromisoformat(captured_end.replace("Z", "+00:00"))
+        except ValueError:
+            parsed_captured_end = None
 
     chunk = models.Chunk(
+        **({"id": parsed_chunk_id} if parsed_chunk_id is not None else {}),
+        original_storage_key=original_key,
+        original_hash=original_hash,
+        original_size=original_size,
+        derived_hash=file_hash if burn_result is not None else None,
+        processing=processing,
+        received_via="central",
+        captured_start=parsed_recorded_at,
+        captured_end=parsed_captured_end,
         chunk_number=chunk_number,
         storage_key=storage_key,
         file_size=bytes_written,
@@ -393,15 +507,24 @@ async def upload_chunk(
         recorded_at=parsed_recorded_at,
     )
 
-    updated = await models.RecordingSession.get_motor_collection().find_one_and_update(
-        {"_id": recording_id, "chunks.chunk_number": {"$ne": chunk_number}},
-        {"$push": {"chunks": chunk.model_dump()}},
-        return_document=ReturnDocument.AFTER,
-    )
-    if updated is None:
-        # Lost the race -- a concurrent request already pushed this exact
-        # chunk_number in between our fast-path check and this atomic push.
+    try:
+        updated = await models.RecordingSession.get_motor_collection().find_one_and_update(
+            {"_id": recording_id, "chunks.chunk_number": {"$ne": chunk_number}},
+            {"$push": {"chunks": chunk.model_dump()}},
+            return_document=ReturnDocument.AFTER,
+        )
+    except Exception:
+        # The database write failed: nothing references our objects, and they are ours alone (unique keys), so remove them.
         storage.delete(storage_key)
+        if original_key:
+            storage.delete(original_key)
+        raise
+    if updated is None:
+        # Lost the race -- a concurrent request already pushed this exact chunk_number between our fast-path check and the
+        # atomic push. Our keys carry our own token, so this deletes only what THIS request wrote, never the winner's object.
+        storage.delete(storage_key)
+        if original_key:
+            storage.delete(original_key)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Chunk {chunk_number} was already uploaded for this recording",
@@ -432,6 +555,8 @@ async def upload_chunk(
         latitude=chunk.latitude,
         longitude=chunk.longitude,
         recorded_at=chunk.recorded_at,
+        original_hash=chunk.original_hash,
+        received_via=chunk.received_via,
     )
 
 
@@ -613,8 +738,14 @@ async def list_recordings(
     role = current_user.role
     query = models.RecordingSession.find()
 
-    if role in (models.UserRole.admin, models.UserRole.control_room):
+    if role == models.UserRole.admin:
         pass
+    elif role == models.UserRole.control_room:
+        # Same site policy as the single-recording endpoints (_authorize_recording_access): recordings of RESTRICTED
+        # sites this user may not view are filtered out BEFORE paging, so neither rows nor page boundaries leak them.
+        hidden = [s.id for s in await models.MonitoredSite.find({"access_mode": "restricted"}).to_list() if not site_access.can_view_user(s, current_user)]
+        if hidden:
+            query = query.find(NotIn(models.RecordingSession.site_id, hidden))
     elif role == models.UserRole.station:
         if not current_user.station_id:
             return []
@@ -687,6 +818,8 @@ async def get_recording_manifest(
                 latitude=c.latitude,
                 longitude=c.longitude,
                 recorded_at=c.recorded_at,
+                original_hash=c.original_hash,
+                received_via=c.received_via,
             )
             for c in chunks
         ],

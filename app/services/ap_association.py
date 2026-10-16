@@ -64,12 +64,18 @@ class VirtualAPAssociationProvider(APAssociationProvider):
 class RealAPAssociationProvider(APAssociationProvider):
     """
     Fed by an authenticated device reporting its own genuine association
-    (routers/presence.py::associate, today the only caller). A future
-    PhysicalAPAssociationProvider -- fed by an edge server instead of a
-    device's own JWT -- would be this exact same class with a different
-    upstream caller; there is nothing else to add.
+    (routers/presence.py::associate).
     """
     source = models.PresenceEventSource.real
+
+
+class PhysicalAPAssociationProvider(APAssociationProvider):
+    """
+    Fed by an authorized edge collector or physical AP controller
+    (routers/ap_telemetry.py) reporting real radio association telemetry.
+    """
+    source = models.PresenceEventSource.controller
+
 
 
 async def find_nearest_access_point(
@@ -104,7 +110,7 @@ async def find_nearest_access_point(
             id=doc["_id"], code=doc["code"], name=doc["name"], zone=doc.get("zone"),
             deployment=doc.get("deployment"), station_id=doc.get("station_id"),
             location=doc.get("location"), enabled=doc.get("enabled", True),
-            status=doc.get("status", models.AccessPointStatus.online),
+            status=doc.get("status", models.AccessPointStatus.unknown),
             is_demo=doc.get("is_demo", False), created_at=doc["created_at"], updated_at=doc["updated_at"],
         )
         return ap, doc["distance_meters"]

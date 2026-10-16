@@ -16,7 +16,7 @@ not both, to avoid two parallel and potentially inconsistent auth paths.
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import Dict, Optional, Set
+from typing import Callable, Dict, Optional, Set, Tuple
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from jose import JWTError
@@ -37,6 +37,9 @@ class ConnectionManager:
 
     def __init__(self):
         self.control_room_connections: Set[WebSocket] = set()
+        # ws -> (user id, role value). Lets site-scoped events (network monitoring) reach only
+        # the control-room users authorized for that site. Populated by websocket_endpoint.
+        self.control_room_meta: Dict[WebSocket, Tuple[uuid.UUID, str]] = {}
         self.station_connections: Dict[uuid.UUID, Set[WebSocket]] = {}
         self.constable_connections: Dict[uuid.UUID, Set[WebSocket]] = {}
 
@@ -61,6 +64,7 @@ class ConnectionManager:
     def disconnect(self, ws: WebSocket, *, station_id: Optional[uuid.UUID] = None, constable_id: Optional[uuid.UUID] = None):
         """Remove a connection from wherever it was registered. Safe to call even if it was never added (e.g. auth failed before accept)."""
         self.control_room_connections.discard(ws)
+        self.control_room_meta.pop(ws, None)
         if station_id is not None and station_id in self.station_connections:
             self.station_connections[station_id].discard(ws)
         if constable_id is not None and constable_id in self.constable_connections:
@@ -87,6 +91,11 @@ class ConnectionManager:
 
     async def send_to_control_room(self, message: dict):
         await self._send_to_all(self.control_room_connections, message)
+
+    async def send_to_control_room_where(self, message: dict, allow: Callable[[uuid.UUID, str], bool]):
+        """Like send_to_control_room, but only to connections whose (user id, role) satisfy `allow`."""
+        targets = {ws for ws in self.control_room_connections if (ws in self.control_room_meta and allow(*self.control_room_meta[ws]))}
+        await self._send_to_all(targets, message)
 
     async def send_to_station(self, station_id: Optional[uuid.UUID], message: dict):
         if station_id is None:
@@ -180,6 +189,7 @@ async def websocket_endpoint(
             return
         await websocket.accept()
         manager.add_control_room(websocket)
+        manager.control_room_meta[websocket] = (user.id, role.value if hasattr(role, "value") else str(role))
     elif role == models.UserRole.station:
         if not user.station_id:
             await websocket.close(code=4403)

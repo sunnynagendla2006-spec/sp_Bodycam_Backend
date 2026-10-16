@@ -77,14 +77,18 @@ async def test_device_response_already_has_everything_the_live_map_needs_besides
         assert field in device
 
 
-async def test_device_location_is_the_last_reported_one_even_after_going_offline(full_client, make_constable, auth_header):
+async def test_device_location_is_the_last_reported_one_even_after_going_offline(full_client, make_constable, auth_header, fix):
     """The 'last known location' shown for an offline constable must be a
     real, previously-reported GPS fix -- never 0,0 or fabricated."""
     await make_constable(phone="m000000008")
     headers = await auth_header("m000000008", "correct-horse-battery")
     device_id = await _register_device(full_client, headers, "phone-m008")
+    from app import models
+    await models.Device.find_one(models.Device.device_identifier == "phone-m008").update({"$set": {"enrolment_status": "approved"}})
+    start = await full_client.post("/constables/me/duty-session/start", json={"device_identifier": "phone-m008"}, headers=headers)
+    assert start.status_code == 200, start.text
 
-    loc_resp = await full_client.post("/constables/me/location", json={"latitude": 16.5062, "longitude": 80.6480}, headers=headers)
+    loc_resp = await full_client.post("/constables/me/location", json=fix(seq=1, lat=16.5062, lon=80.6480), headers=headers)
     assert loc_resp.status_code == 200
 
     device_resp = await full_client.get(f"/devices/{device_id}", headers=headers)

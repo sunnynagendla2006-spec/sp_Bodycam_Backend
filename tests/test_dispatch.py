@@ -436,27 +436,21 @@ async def test_constable_cannot_set_verified_via_me_status(
 # ---------------------------------------------------------------------------
 # LOCATION (32-37)
 # ---------------------------------------------------------------------------
-async def test_constable_can_update_own_location_via_me(full_client, make_constable, auth_header):
-    _, constable = await make_constable(phone="l000000001")
-    headers = await auth_header("l000000001", "correct-horse-battery")
-    resp = await full_client.post(
-        "/constables/me/location", json={"latitude": 16.5062, "longitude": 80.6480, "accuracy": 8.5}, headers=headers
-    )
+async def test_constable_can_update_own_location_via_me(full_client, go_on_duty, fix):
+    duty = await go_on_duty(phone="l000000001")
+    resp = await full_client.post("/constables/me/location", json=fix(seq=1, accuracy=8.5), headers=duty["headers"])
     assert resp.status_code == 200
-    assert resp.json()["constable_id"] == str(constable.id)
+    assert resp.json()["constable_id"] == str(duty["constable"].id)
 
 
-async def test_constable_cannot_target_another_constable_through_me_endpoint(full_client, make_constable, auth_header):
+async def test_constable_cannot_target_another_constable_through_me_endpoint(full_client, make_constable, go_on_duty, fix):
     """The /me endpoint takes no constable_id at all -- there's structurally
     nothing to spoof. This just re-confirms the response always reflects
     the caller's own id regardless of what's in the (nonexistent) target field."""
-    _, constable_a = await make_constable(phone="l000000002a")
+    duty_a = await go_on_duty(phone="l000000002a")
+    constable_a = duty_a["constable"]
     _, constable_b = await make_constable(phone="l000000002b")
-    headers_a = await auth_header("l000000002a", "correct-horse-battery")
-
-    resp = await full_client.post(
-        "/constables/me/location", json={"latitude": 1.0, "longitude": 1.0}, headers=headers_a
-    )
+    resp = await full_client.post("/constables/me/location", json=fix(seq=1, lat=1.0, lon=1.0), headers=duty_a["headers"])
     assert resp.json()["constable_id"] == str(constable_a.id)
     assert resp.json()["constable_id"] != str(constable_b.id)
 
@@ -488,11 +482,10 @@ async def test_negative_accuracy_rejected(full_client, make_constable, auth_head
     assert resp.status_code == 422
 
 
-async def test_server_timestamp_used_for_location(full_client, make_constable, auth_header):
-    _, constable = await make_constable(phone="l000000006")
-    headers = await auth_header("l000000006", "correct-horse-battery")
-    resp = await full_client.post(
-        "/constables/me/location", json={"latitude": 16.0, "longitude": 80.0}, headers=headers
-    )
+async def test_server_receipt_time_is_recorded_separately_from_client_time(full_client, go_on_duty, fix):
+    duty = await go_on_duty(phone="l000000006")
+    resp = await full_client.post("/constables/me/location", json=fix(seq=1, age_seconds=5), headers=duty["headers"])
     assert resp.status_code == 200
-    assert resp.json()["timestamp"] is not None  # server-assigned, no client timestamp accepted at all
+    body = resp.json()
+    assert body["recorded_at"] is not None and body["server_received_at"] is not None  # client-generated vs server-confirmed
+    assert body["recorded_at"] < body["server_received_at"]

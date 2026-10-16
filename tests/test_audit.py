@@ -155,17 +155,14 @@ async def test_assignment_status_change_audited(full_client, make_constable, mak
 # ---------------------------------------------------------------------------
 # 9. Location update audited
 # ---------------------------------------------------------------------------
-async def test_location_update_audited(full_client, make_constable, auth_header):
-    _, constable = await make_constable(phone="a000000009")
-    headers = await auth_header("a000000009", "correct-horse-battery")
-
-    resp = await full_client.post(
-        "/constables/me/location", json={"latitude": 16.0, "longitude": 80.0}, headers=headers
-    )
+async def test_duty_start_audited_but_individual_fixes_are_not(full_client, go_on_duty, fix):
+    """Starting/ending tracking authorisation is audited; every GPS fix is NOT (it would flood the audit log with routine telemetry)."""
+    duty = await go_on_duty(phone="a000000009")
+    resp = await full_client.post("/constables/me/location", json=fix(seq=1), headers=duty["headers"])
     assert resp.status_code == 200
 
-    entries = await _get_logs("constable.location_updated")
-    assert len(entries) == 1
+    assert len(await _get_logs("duty.started")) == 1
+    assert len(await _get_logs("constable.location_updated")) == 0
 
 
 # ---------------------------------------------------------------------------
