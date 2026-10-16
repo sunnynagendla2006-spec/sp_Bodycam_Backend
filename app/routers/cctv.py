@@ -49,6 +49,8 @@ from ..services import events
 from ..services import cctv_providers
 from ..services import cctv_security
 from ..services import cctv_discovery
+from ..services import cctv_gateway
+from ..services import cctv_playback
 
 router = APIRouter(prefix="/cctv", tags=["CCTV"])
 
@@ -101,6 +103,9 @@ def _to_camera_response(camera: models.CCTVCamera) -> schemas.CCTVCameraResponse
         last_status_check_at=camera.last_status_check_at,
         last_error=camera.last_error,
         is_demo=camera.is_demo,
+        building_id=camera.building_id,
+        channel=camera.channel,
+        sort_order=camera.sort_order,
         created_at=camera.created_at,
         updated_at=camera.updated_at,
         created_by=camera.created_by,
@@ -392,7 +397,9 @@ async def update_camera(
     new_host = payload.stream_host if payload.stream_host is not None else camera.stream_host
     new_port = payload.stream_port if payload.stream_port is not None else camera.stream_port
     if payload.stream_host is not None or payload.stream_port is not None:
-        _validate_target_or_400(new_host, new_port)
+        # A building's own authorized networks apply to its cameras (and only its cameras).
+        with cctv_security.extra_networks(await cctv_playback.camera_networks(camera)):
+            _validate_target_or_400(new_host, new_port)
     camera.stream_host = new_host
     camera.stream_port = new_port
 
@@ -414,6 +421,14 @@ async def update_camera(
     camera.updated_at = _utcnow()
     camera.updated_by = current_user.id
     await camera.save()
+    # Any connection change invalidates a gateway path built from the old settings;
+    # the next playback request re-registers it from the new ones.
+    if (
+        any(v is not None for v in (payload.provider_type, payload.stream_protocol, payload.stream_host, payload.stream_port, payload.stream_path, payload.username))
+        or payload.secret
+        or payload.clear_secret
+    ):
+        await cctv_playback.release_path(camera.id)
 
     await log_action(user_id=current_user.id, action="camera_updated", details={"camera_id": str(camera_id)})
     await events.publish_cctv_updated(camera)
@@ -429,6 +444,7 @@ async def delete_camera(
     """admin-only, hard delete. Does not touch any CCTVStreamSession history for this camera -- those rows remain for audit purposes, orphaned by camera_id the same way AuditLog rows survive other deletions elsewhere in this codebase."""
     camera = await _get_camera_or_404(camera_id)
     await camera.delete()
+    await cctv_playback.release_path(camera_id)
 
     await log_action(user_id=current_user.id, action="camera_deleted", details={"camera_id": str(camera_id), "camera_code": camera.camera_code})
     await events.publish_cctv_deleted(camera_id)
@@ -493,7 +509,8 @@ async def test_camera(
     provider = cctv_providers.get_provider(camera.provider_type)
 
     try:
-        result = await provider.validate_connection(camera)
+        with cctv_security.extra_networks(await cctv_playback.camera_networks(camera)):
+            result = await provider.validate_connection(camera)
     except NotImplementedError as exc:
         raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(exc))
 
@@ -597,7 +614,10 @@ async def request_stream(
 
     provider = cctv_providers.get_provider(camera.provider_type)
     try:
+        await cctv_playback.check_capacity(cctv_gateway.path_name(camera.id))
         result = await provider.start_stream(camera, session)
+    except cctv_playback.PlaybackError as exc:
+        result = cctv_providers.CCTVStreamStartResult(ok=False, error=exc.message)
     except NotImplementedError as exc:
         result = cctv_providers.CCTVStreamStartResult(ok=False, error=str(exc))
 
@@ -621,12 +641,21 @@ async def request_stream(
         await log_action(user_id=current_user.id, action="camera_stream_failed", details={"camera_id": str(camera_id), "session_id": str(session.id), "error": result.error})
         await events.publish_cctv_stream_failed(session, camera, result.error)
 
+    playback = None
+    if result.ok and result.gateway == "mediamtx" and result.stream_reference:
+        token, expires_at = cctv_gateway.mint_playback_token(current_user.id, camera.id)
+        playback = schemas.CCTVPlaybackResponse(
+            camera_id=camera.id, path=result.stream_reference, whep_url=cctv_gateway.whep_url(result.stream_reference),
+            token=token, expires_at=expires_at, ttl_seconds=cctv_gateway.playback_ttl_seconds(),
+        )
+
     return schemas.CCTVStreamStartResponse(
         session=schemas.CCTVStreamSessionResponse.model_validate(session, from_attributes=True),
         livekit_url=result.livekit_url,
         token=result.token,
         identity=result.identity,
         can_publish=False,
+        playback=playback,
     )
 
 

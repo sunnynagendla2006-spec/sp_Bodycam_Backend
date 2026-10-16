@@ -1,11 +1,11 @@
 import enum
 import ipaddress
 import re
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing import Optional, List, Literal
 import uuid
 from datetime import datetime
-from .models import UserRole, UserStatus, ConstableStatus, IncidentStatus, MediaType, UploadStatus, AssignmentStatus, DeviceStatus, AlertType, AlertSeverity, AlertStatus, RecordingTriggerType, RecordingStatus, RemoteCommandType, RemoteCommandStatus, LiveStreamStatus, LiveStreamStartedBy, CCTVProviderType, CCTVStreamProtocol, CCTVCameraStatus, CCTVStreamSessionStatus, CCTVCapabilities, AccessPointStatus, APVerificationStatus, APLifecycleStatus, APIntegrationHealth, EnrolmentStatus, PresenceConnectionStatus, PresenceEventSource, DeploymentStatus, ZoneType
+from .models import UserRole, UserStatus, ConstableStatus, IncidentStatus, MediaType, UploadStatus, AssignmentStatus, DeviceStatus, AlertType, AlertSeverity, AlertStatus, RecordingTriggerType, RecordingStatus, RemoteCommandType, RemoteCommandStatus, LiveStreamStatus, LiveStreamStartedBy, CCTVProviderType, CCTVStreamProtocol, CCTVConnectionMode, CCTVNetworkAccess, CCTVVendorPreset, CCTVCameraStatus, CCTVStreamSessionStatus, CCTVCapabilities, AccessPointStatus, APVerificationStatus, APLifecycleStatus, APIntegrationHealth, EnrolmentStatus, PresenceConnectionStatus, PresenceEventSource, DeploymentStatus, ZoneType
 
 class UserBase(BaseModel):
     phone: str
@@ -551,6 +551,10 @@ class RecordingStartRequest(BaseModel):
     # existing RecordingEngine default and every pre-existing caller that
     # doesn't send this field at all.
     camera_lens_direction: Optional[str] = None
+    # Optional, backward compatible: a CLIENT-generated recording id (the phone's own UUID) makes start idempotent and keeps
+    # the same id when a recording moves between a site receiver and this server. Older clients simply omit both fields.
+    recording_id: Optional[uuid.UUID] = None
+    site_id: Optional[uuid.UUID] = None
 
 class RecordingSessionResponse(BaseModel):
     id: uuid.UUID
@@ -572,6 +576,11 @@ class RecordingSessionResponse(BaseModel):
     # this is "ready".
     playable_status: str = "not_ready"
     camera_lens_direction: str = "back"
+    # Site transport (None/"central" for ordinary online recordings).
+    site_id: Optional[uuid.UUID] = None
+    receiver_id: Optional[uuid.UUID] = None
+    origin: str = "central"
+    flags: List[str] = []
     model_config = ConfigDict(from_attributes=True)
 
 class VideoChunkResponse(BaseModel):
@@ -593,6 +602,9 @@ class VideoChunkResponse(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     recorded_at: Optional[datetime] = None
+    # SHA-256 of the bytes exactly as captured by the phone (`file_hash` may describe a watermarked derivative).
+    original_hash: Optional[str] = None
+    received_via: str = "central"
     model_config = ConfigDict(from_attributes=True)
 
 class RecordingManifestResponse(BaseModel):
@@ -790,6 +802,11 @@ class CCTVCameraResponse(BaseModel):
     last_error: Optional[str] = None
     is_demo: bool
 
+    # Building association (None for cameras registered before buildings existed).
+    building_id: Optional[uuid.UUID] = None
+    channel: Optional[int] = None
+    sort_order: int = 0
+
     created_at: datetime
     updated_at: datetime
     created_by: Optional[uuid.UUID] = None
@@ -849,13 +866,335 @@ class CCTVStreamSessionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class CCTVPlaybackResponse(BaseModel):
+    """Everything a browser needs to watch ONE camera over WebRTC (WHEP). `token` is a short-lived playback token, never a camera credential or a source URL."""
+    camera_id: uuid.UUID
+    protocol: Literal["webrtc"] = "webrtc"
+    path: str
+    whep_url: str
+    token: str
+    expires_at: datetime
+    ttl_seconds: int
+
+
 class CCTVStreamStartResponse(BaseModel):
-    """Never includes a LiveKit API secret -- only a short-lived signed viewer token, when a media gateway actually produced one (see CCTVProvider.start_stream)."""
+    """Never includes a LiveKit API secret -- only a short-lived signed viewer token, when a media gateway actually produced one (see CCTVProvider.start_stream). `playback` is set for gateway (MediaMTX) streams."""
     session: CCTVStreamSessionResponse
     livekit_url: Optional[str] = None
     token: Optional[str] = None
     identity: Optional[str] = None
     can_publish: bool = False
+    playback: Optional[CCTVPlaybackResponse] = None
+
+
+class CCTVStreamingConfigResponse(BaseModel):
+    """Operator-tunable dashboard behaviour (all from environment, see .env.example)."""
+    gateway_configured: bool
+    rotation_seconds: int
+    max_concurrent_streams: int
+    prefetch_next: bool
+    playback_ttl_seconds: int
+
+
+class CCTVPlaybackReport(BaseModel):
+    """A viewer's report that playback of a camera failed (or recovered). Never carries URLs or credentials; free text is length-bounded."""
+    state: Literal["error", "recovered"]
+    reason: Optional[str] = Field(default=None, max_length=200)
+
+
+# ---------------------------------------------------------------------------
+# Buildings (one control-room slot each) and their cameras
+# ---------------------------------------------------------------------------
+
+_BUILDING_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{1,63}$")
+_HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.\-]{0,251}[A-Za-z0-9])?$")
+
+
+def _validate_host(value: Optional[str]) -> Optional[str]:
+    """Hostname or bare IP. Never a URL: no scheme, userinfo, port or path may be smuggled in."""
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        ipaddress.ip_address(value)
+        return value
+    except ValueError:
+        pass
+    if not _HOST_RE.match(value):
+        raise ValueError("must be a hostname or IP address without scheme, port or path")
+    return value
+
+
+class BuildingCameraInput(BaseModel):
+    """One camera row inside a building. In NVR mode only `channel` selects the stream (host/port/path come from the building's recorder); in direct-IP mode the camera's own endpoint is used."""
+    name: str = Field(..., min_length=1, max_length=255)
+    camera_code: Optional[str] = Field(default=None, max_length=64)  # auto-generated from the building code when omitted
+    description: Optional[str] = None
+    channel: Optional[int] = Field(default=None, ge=1, le=512)
+    sort_order: Optional[int] = Field(default=None, ge=0, le=10000)
+    enabled: bool = True
+    provider_type: Literal["rtsp", "onvif"] = "rtsp"
+    # direct-IP mode only:
+    stream_protocol: CCTVStreamProtocol = CCTVStreamProtocol.rtsp
+    stream_host: Optional[str] = None
+    stream_port: int = Field(default=554, ge=1, le=65535)
+    stream_path: Optional[str] = None
+    management_url: Optional[str] = None
+    username: Optional[str] = None
+    secret: Optional[str] = None  # plaintext ONLY as input; encrypted immediately, never echoed
+    latitude: Optional[float] = Field(default=None, ge=-90.0, le=90.0)
+    longitude: Optional[float] = Field(default=None, ge=-180.0, le=180.0)
+
+    @field_validator("stream_host")
+    @classmethod
+    def _host(cls, v):
+        return _validate_host(v)
+
+
+class BuildingCameraUpdate(BaseModel):
+    """All optional. `secret` omitted = unchanged; `clear_secret` removes it explicitly."""
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    description: Optional[str] = None
+    channel: Optional[int] = Field(default=None, ge=1, le=512)
+    sort_order: Optional[int] = Field(default=None, ge=0, le=10000)
+    enabled: Optional[bool] = None
+    provider_type: Optional[Literal["rtsp", "onvif"]] = None
+    stream_protocol: Optional[CCTVStreamProtocol] = None
+    stream_host: Optional[str] = None
+    stream_port: Optional[int] = Field(default=None, ge=1, le=65535)
+    stream_path: Optional[str] = None
+    management_url: Optional[str] = None
+    username: Optional[str] = None
+    secret: Optional[str] = None
+    clear_secret: bool = False
+    latitude: Optional[float] = Field(default=None, ge=-90.0, le=90.0)
+    longitude: Optional[float] = Field(default=None, ge=-180.0, le=180.0)
+
+    @field_validator("stream_host")
+    @classmethod
+    def _host(cls, v):
+        return _validate_host(v)
+
+
+class BuildingBase(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    code: str
+    owner_name: Optional[str] = Field(default=None, max_length=255)
+    owner_contact: Optional[str] = Field(default=None, max_length=255)
+    zone: Optional[str] = Field(default=None, max_length=64)
+    address: Optional[str] = Field(default=None, max_length=500)
+    latitude: float = Field(..., ge=-90.0, le=90.0)
+    longitude: float = Field(..., ge=-180.0, le=180.0)
+    public_ip: Optional[str] = None
+    connection_mode: CCTVConnectionMode = CCTVConnectionMode.nvr
+    network_access: CCTVNetworkAccess = CCTVNetworkAccess.vpn
+    authorized_networks: List[str] = Field(default_factory=list, max_length=32)
+    recorder_vendor: CCTVVendorPreset = CCTVVendorPreset.custom
+    recorder_protocol: CCTVStreamProtocol = CCTVStreamProtocol.rtsp
+    recorder_host: Optional[str] = None
+    recorder_port: int = Field(default=554, ge=1, le=65535)
+    stream_path_template: Optional[str] = Field(default=None, max_length=300)
+    recorder_username: Optional[str] = Field(default=None, max_length=128)
+
+    @field_validator("code")
+    @classmethod
+    def _code(cls, v):
+        v = v.strip()
+        if not _BUILDING_CODE_RE.match(v):
+            raise ValueError("code must be 2-64 characters: letters, digits, '.', '_' or '-'")
+        return v
+
+    @field_validator("public_ip")
+    @classmethod
+    def _public_ip(cls, v):
+        if v is None or not v.strip():
+            return None
+        try:
+            return str(ipaddress.ip_address(v.strip()))
+        except ValueError:
+            raise ValueError("public_ip must be a valid IP address")
+
+    @field_validator("recorder_host")
+    @classmethod
+    def _recorder_host(cls, v):
+        return _validate_host(v)
+
+    @field_validator("authorized_networks")
+    @classmethod
+    def _networks(cls, v):
+        from .services import cctv_security
+        return [str(n) for n in cctv_security.parse_authorized_networks(v)]
+
+    @field_validator("stream_path_template")
+    @classmethod
+    def _template(cls, v):
+        from .services import cctv_sources
+        return cctv_sources.validate_path_template(v)
+
+
+class BuildingCreateRequest(BuildingBase):
+    recorder_secret: Optional[str] = None  # plaintext ONLY as input
+    cameras: List[BuildingCameraInput] = Field(default_factory=list, max_length=128)
+    is_demo: bool = False
+
+    @model_validator(mode="after")
+    def _consistency(self):
+        check_building_consistency(self)
+        return self
+
+
+class BuildingUpdateRequest(BaseModel):
+    """All optional; only provided fields change. The cross-field rules are re-checked against the merged result by the router."""
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    owner_name: Optional[str] = Field(default=None, max_length=255)
+    owner_contact: Optional[str] = Field(default=None, max_length=255)
+    zone: Optional[str] = Field(default=None, max_length=64)
+    address: Optional[str] = Field(default=None, max_length=500)
+    latitude: Optional[float] = Field(default=None, ge=-90.0, le=90.0)
+    longitude: Optional[float] = Field(default=None, ge=-180.0, le=180.0)
+    public_ip: Optional[str] = None
+    clear_public_ip: bool = False
+    connection_mode: Optional[CCTVConnectionMode] = None
+    network_access: Optional[CCTVNetworkAccess] = None
+    authorized_networks: Optional[List[str]] = Field(default=None, max_length=32)
+    recorder_vendor: Optional[CCTVVendorPreset] = None
+    recorder_protocol: Optional[CCTVStreamProtocol] = None
+    recorder_host: Optional[str] = None
+    recorder_port: Optional[int] = Field(default=None, ge=1, le=65535)
+    stream_path_template: Optional[str] = Field(default=None, max_length=300)
+    recorder_username: Optional[str] = Field(default=None, max_length=128)
+    recorder_secret: Optional[str] = None
+    clear_recorder_secret: bool = False
+
+    @field_validator("public_ip")
+    @classmethod
+    def _public_ip(cls, v):
+        if v is None or not v.strip():
+            return None
+        try:
+            return str(ipaddress.ip_address(v.strip()))
+        except ValueError:
+            raise ValueError("public_ip must be a valid IP address")
+
+    @field_validator("recorder_host")
+    @classmethod
+    def _recorder_host(cls, v):
+        return _validate_host(v)
+
+    @field_validator("authorized_networks")
+    @classmethod
+    def _networks(cls, v):
+        if v is None:
+            return None
+        from .services import cctv_security
+        return [str(n) for n in cctv_security.parse_authorized_networks(v)]
+
+    @field_validator("stream_path_template")
+    @classmethod
+    def _template(cls, v):
+        from .services import cctv_sources
+        return cctv_sources.validate_path_template(v)
+
+
+def check_building_consistency(b) -> None:
+    """Cross-field rules shared by create and the router's merged update. Raises ValueError."""
+    if b.connection_mode == CCTVConnectionMode.nvr:
+        if not b.recorder_host:
+            raise ValueError("recorder_host is required for NVR/DVR mode")
+        if b.recorder_vendor == CCTVVendorPreset.custom and "{channel}" not in (b.stream_path_template or ""):
+            raise ValueError("a custom recorder needs a stream_path_template containing {channel}")
+    if b.network_access == CCTVNetworkAccess.public_direct and not b.public_ip:
+        raise ValueError("public_ip is required when network_access is public_direct")
+
+
+class BuildingCameraBrief(BaseModel):
+    """Minimal per-camera data for a control-room slot. No hosts, ports, paths or credentials."""
+    id: uuid.UUID
+    name: str
+    camera_code: str
+    channel: Optional[int] = None
+    sort_order: int = 0
+    enabled: bool
+    status: CCTVCameraStatus
+    last_seen_at: Optional[datetime] = None
+    last_error: Optional[str] = None
+
+
+class BuildingResponse(BaseModel):
+    """Safe building view. Camera counts are derived from camera rows. Infrastructure fields (owner contact, IPs, networks, recorder host) are set only for admins."""
+    id: uuid.UUID
+    name: str
+    code: str
+    owner_name: Optional[str] = None
+    owner_contact: Optional[str] = None
+    zone: Optional[str] = None
+    address: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    public_ip: Optional[str] = None
+    connection_mode: CCTVConnectionMode
+    network_access: CCTVNetworkAccess
+    authorized_networks: List[str] = Field(default_factory=list)
+    recorder_vendor: CCTVVendorPreset
+    recorder_protocol: CCTVStreamProtocol
+    recorder_host: Optional[str] = None
+    recorder_port: Optional[int] = None
+    stream_path_template: Optional[str] = None
+    recorder_username: Optional[str] = None
+    recorder_credentials_configured: bool = False
+    enabled: bool
+    camera_count: int = 0
+    enabled_camera_count: int = 0
+    online_count: int = 0
+    offline_count: int = 0
+    health: Literal["online", "degraded", "offline", "unknown", "empty", "disabled"] = "unknown"
+    created_at: datetime
+    updated_at: datetime
+
+
+class BuildingDetailResponse(BuildingResponse):
+    cameras: List[BuildingCameraBrief] = Field(default_factory=list)
+
+
+class BuildingListResponse(BaseModel):
+    items: List[BuildingDetailResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+class CameraAssignRequest(BaseModel):
+    """Assign an existing camera to a building (or detach with building_id=null)."""
+    building_id: Optional[uuid.UUID] = None
+    channel: Optional[int] = Field(default=None, ge=1, le=512)
+    sort_order: Optional[int] = Field(default=None, ge=0, le=10000)
+
+
+class CameraReorderRequest(BaseModel):
+    camera_ids: List[uuid.UUID] = Field(..., min_length=1, max_length=256)
+
+
+class CCTVHealthRunResponse(BaseModel):
+    cameras_checked: int
+    targets_probed: int
+    status_changes: int
+    skipped_not_due: int
+
+
+class BuildingTestTarget(BaseModel):
+    """One probed endpoint of a building: the NVR itself, or one direct-IP camera. Error text is sanitised (no addresses)."""
+    target: str
+    status: CCTVCameraStatus
+    latency_ms: Optional[float] = None
+    error: Optional[str] = None
+    camera_ids: List[uuid.UUID] = Field(default_factory=list)
+
+
+class BuildingTestResponse(BaseModel):
+    building_id: uuid.UUID
+    results: List[BuildingTestTarget]
 
 
 # ---------------------------------------------------------------------------

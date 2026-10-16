@@ -46,7 +46,7 @@ AUTHORIZED CAMERA (admin-registered only)
         v
   CCTVCamera.status (online/offline/degraded/unknown/disabled)
 
-Browser-viewable streaming (WebRTC/HLS bridge): [NOT IMPLEMENTED]
+Browser-viewable streaming (WebRTC via MediaMTX): [IMPLEMENTED, NOT RUNTIME VERIFIED -- see docs/CCTV_BUILDINGS_AND_GATEWAY.md]
   -- see "Streaming" below.
 ```
 

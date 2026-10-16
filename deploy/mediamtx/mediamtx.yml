@@ -1,0 +1,71 @@
+# MediaMTX configuration for the SP Bodycam CCTV gateway.
+#
+# Role: pull RTSP(S) from building NVRs/cameras (over VPN/tunnel) ON DEMAND and
+# serve them to authenticated browsers over WebRTC (WHEP). Camera paths are NOT
+# listed here: the backend registers one path per camera at runtime through the
+# control API (app/services/cctv_gateway.py) and removes it when no longer needed.
+#
+# NOT VERIFIED AT RUNTIME. Written against MediaMTX v1.9.x parameter names
+# (see the pinned image in ../docker-compose.cctv.yml). Option names change
+# between MediaMTX releases (for example webrtcAllowOrigin became
+# webrtcAllowOrigins in later versions): when you change the image tag, diff
+# this file against that release's mediamtx.yml.
+#
+# Contains NO secrets. The auth callback URL (which carries the shared key) is
+# injected from the environment: MTX_AUTHHTTPADDRESS (see the compose file).
+
+logLevel: info
+
+# --- Protocols we do not serve --------------------------------------------
+rtsp: no
+rtmp: no
+hls: no
+srt: no
+metrics: no
+pprof: no
+playback: no
+
+# --- Control API: INTERNAL ONLY ---------------------------------------------
+# Never publish this port. The backend reaches it over the private docker
+# network (CCTV_GATEWAY_API_URL=http://mediamtx:9997).
+api: yes
+apiAddress: :9997
+
+# --- WebRTC (browser playback) ------------------------------------------------
+webrtc: yes
+webrtcAddress: :8889
+# TLS is terminated by the reverse proxy in front of this port in production.
+webrtcEncryption: no
+# Browsers call WHEP cross-origin from the dashboard. Playback is still gated by
+# the short-lived token, so '*' does not grant access by itself; tighten to the
+# dashboard origin if you prefer.
+webrtcAllowOrigin: '*'
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: ''
+# Set to the gateway's public IP/DNS name so browsers get reachable ICE candidates.
+# (Override with MTX_WEBRTCADDITIONALHOSTS in the environment.)
+webrtcAdditionalHosts: []
+webrtcICEServers2: []
+
+# --- Authentication -------------------------------------------------------------
+# Every browser read is checked by the backend (POST /cctv/gateway/auth), which
+# accepts only a valid, unexpired playback token minted for exactly that path.
+authMethod: http
+authHTTPAddress: http://backend:8000/cctv/gateway/auth
+authHTTPExclude:
+  - action: api
+  - action: metrics
+  - action: pprof
+
+# The control API is open only to the docker network the backend lives on.
+# Adjust the CIDR to your compose network if it is outside 172.16.0.0/12.
+authInternalUsers:
+  - user: any
+    pass:
+    ips: ['127.0.0.1', '::1', '172.16.0.0/12']
+    permissions:
+      - action: api
+
+# No static paths: nothing is reachable until the backend registers it, so an
+# unregistered path name can never be used to pull an arbitrary source.
+paths: {}

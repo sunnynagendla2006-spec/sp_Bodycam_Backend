@@ -28,6 +28,10 @@ def _utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
 
+def _aware(dt: datetime.datetime) -> datetime.datetime:
+    return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)
+
+
 class PresenceError(Exception):
     """Raised for an expected, caller-facing rejection (never a bug) -- `code` maps to a specific HTTP status in routers/presence.py."""
 
@@ -44,6 +48,8 @@ class ProcessAssociationResult:
     handoff_created: bool
     is_first_association: bool = False
     duplicate_event: bool = False
+    # True when the event was OLDER than state already held for this device and was therefore not applied.
+    stale_event: bool = False
 
 
 async def process_association(
@@ -67,9 +73,18 @@ async def process_association(
     now = occurred_at or _utcnow()
     presence = await models.PolicePresence.find_one(models.PolicePresence.device_id == device.id)
 
+    # --- Ordering guard: an event OLDER than the state already held must never overwrite it.
+    # (A delayed controller event arriving after a newer association used to move the device back.)
+    # Equal timestamps are not "older": same-AP repeats stay idempotent heartbeats. This guard does not
+    # replace the full per-event ordering of the network monitoring platform (services/site_events.py).
+    if presence and presence.last_seen_at is not None and occurred_at is not None and presence.current_access_point_id != access_point.id:
+        if _aware(occurred_at) < _aware(presence.last_seen_at):
+            return ProcessAssociationResult(presence=presence, handoff=None, handoff_created=False, stale_event=True)
+
     # --- Duplicate / same-AP heartbeat: idempotent no-op on handoff -------
     if presence and presence.current_access_point_id == access_point.id:
-        presence.last_seen_at = now
+        # never move the freshness marker backwards because of a late duplicate
+        presence.last_seen_at = now if presence.last_seen_at is None else max(_aware(now), _aware(presence.last_seen_at))
         presence.source = source
         presence.status = models.PresenceConnectionStatus.connected
         if event_id:

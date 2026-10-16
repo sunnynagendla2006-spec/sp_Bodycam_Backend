@@ -197,6 +197,8 @@ async def full_client(mongo_db):
     from app.routers import audit_logs as audit_logs_router_module
     from app.routers import auth as auth_router_module
     from app.routers import cctv as cctv_router_module
+    from app.routers import cctv_buildings as cctv_buildings_router_module
+    from app.routers import cctv_streaming as cctv_streaming_router_module
     from app.routers import commands as commands_router_module
     from app.routers import constables as constables_router_module
     from app.routers import deployments as deployments_router_module
@@ -231,6 +233,9 @@ async def full_client(mongo_db):
     app.include_router(websocket_router_module.router)
     app.include_router(live_stream_router_module.router)
     app.include_router(cctv_router_module.router)
+    app.include_router(cctv_buildings_router_module.router)
+    app.include_router(cctv_buildings_router_module.camera_router)
+    app.include_router(cctv_streaming_router_module.router)
     app.include_router(access_points_router_module.router)
     app.include_router(presence_router_module.router)
     app.include_router(deployments_router_module.router)

@@ -1,5 +1,11 @@
 # Multi-Vendor CCTV Integration
 
+> **Update:** the media bridge described below as "not implemented" now has an implementation
+> (MediaMTX gateway, per-building NVR/direct-IP configuration, playback tokens, building wall). See
+> [CCTV_BUILDINGS_AND_GATEWAY.md](CCTV_BUILDINGS_AND_GATEWAY.md). It is **not runtime verified** and needs a
+> deployed gateway plus real recorders. NVR/VMS *vendor API* providers (`provider_type` nvr/vms) remain placeholders.
+
+
 ## 1. Problem
 
 Real deployments mix camera brands — Hikvision, Dahua, Axis, Reolink,

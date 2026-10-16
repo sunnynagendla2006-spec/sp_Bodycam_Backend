@@ -2,7 +2,7 @@ import enum
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from beanie import Document, TimeSeriesConfig, Granularity
 from pydantic import BaseModel, Field
@@ -572,6 +572,19 @@ class Chunk(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     recorded_at: Optional[datetime] = None
+    # --- Evidence preservation (all optional; chunks stored before this existed simply have none) ---
+    # `storage_key`/`file_hash` describe the SERVED media (possibly watermarked). The bytes exactly as
+    # captured by the phone are kept separately and never rewritten:
+    original_storage_key: Optional[str] = None
+    original_hash: Optional[str] = None  # SHA-256 of the captured bytes (client-declared and server-verified when supplied)
+    original_size: Optional[int] = None
+    derived_hash: Optional[str] = None  # SHA-256 of the watermarked/derived media (same as file_hash when a derivative exists)
+    processing: List[dict] = Field(default_factory=list)  # custody/provenance: {step, at, tool, input_hash, output_hash}
+    received_via: str = "central"  # central | site_receiver
+    receiver_id: Optional[uuid.UUID] = None
+    captured_start: Optional[datetime] = None
+    captured_end: Optional[datetime] = None
+    site_received_at: Optional[datetime] = None  # when the site receiver durably stored it
 
 
 class RecordingSession(Document):
@@ -587,6 +600,12 @@ class RecordingSession(Document):
     playable_status: str = "not_ready"
     playable_storage_key: Optional[str] = None
     camera_lens_direction: str = "back"
+    # Site transport (optional): recordings made at a site, possibly received by a local receiver first.
+    site_id: Optional[uuid.UUID] = None
+    receiver_id: Optional[uuid.UUID] = None
+    origin: str = "central"  # central | site_receiver
+    grant_id: Optional[uuid.UUID] = None
+    flags: List[str] = Field(default_factory=list)  # e.g. grant_revoked_later
     chunks: List[Chunk] = []
 
     class Settings:
@@ -596,6 +615,7 @@ class RecordingSession(Document):
             IndexModel([("device_id", ASCENDING)]),
             IndexModel([("status", ASCENDING)]),
             IndexModel([("created_at", ASCENDING)]),
+            IndexModel([("site_id", ASCENDING), ("created_at", -1)]),
         ]
 
 
@@ -753,6 +773,20 @@ class CCTVCamera(Document):
     # Per the authorized-camera policy (never presented as real city CCTV).
     is_demo: bool = False
 
+    # --- Building association (all optional: cameras registered before
+    # buildings existed simply have building_id=None and keep working as
+    # standalone cameras -- see app/routers/cctv_buildings.py).
+    building_id: Optional[uuid.UUID] = None
+    # NVR/DVR channel number. Only meaningful when the building's
+    # connection_mode is "nvr"; the RTSP path is built from the building's
+    # recorder settings plus this number (see services/cctv_sources.py).
+    channel: Optional[int] = None
+    sort_order: int = 0
+    # Health-monitor bookkeeping (services/cctv_health.py): bounded retry
+    # with exponential backoff instead of re-probing a dead camera every cycle.
+    consecutive_failures: int = 0
+    next_check_at: Optional[datetime] = None
+
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
     created_by: Optional[uuid.UUID] = None
@@ -762,11 +796,93 @@ class CCTVCamera(Document):
     class Settings:
         name = "cctv_cameras"
         indexes = [
+            IndexModel([("building_id", ASCENDING), ("sort_order", ASCENDING)]),
             IndexModel([("camera_code", ASCENDING)], unique=True),
             IndexModel([("station_id", ASCENDING)]),
             IndexModel([("zone", ASCENDING)]),
             IndexModel([("enabled", ASCENDING)]),
             IndexModel([("status", ASCENDING)]),
+            IndexModel([("location", "2dsphere")]),
+        ]
+
+
+class CCTVConnectionMode(str, enum.Enum):
+    """How a building's cameras are reached. NVR/DVR is the preferred default: one recorder endpoint, cameras addressed by channel number."""
+    nvr = "nvr"
+    direct_ip = "direct_ip"
+
+
+class CCTVNetworkAccess(str, enum.Enum):
+    """
+    How the backend/gateway reaches the building's network. Informational
+    plus policy: only `public_direct` implies a public endpoint the building
+    owner has deliberately exposed. VPN/tunnel/LAN do not require any public
+    IP at all.
+    """
+    vpn = "vpn"
+    tunnel = "tunnel"
+    lan = "lan"
+    public_direct = "public_direct"
+
+
+class CCTVVendorPreset(str, enum.Enum):
+    """Explicit RTSP path presets for NVR channels. `custom` means the admin supplies the template; no vendor format is ever guessed."""
+    hikvision = "hikvision"
+    dahua = "dahua"
+    custom = "custom"
+
+
+class Building(Document):
+    """
+    A monitored building: ONE control-room slot, MANY cameras (CCTVCamera
+    rows with building_id == this id). The camera count is never stored --
+    it is always derived from the camera rows so it cannot drift.
+    """
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    name: str
+    code: str
+    owner_name: Optional[str] = None
+    owner_contact: Optional[str] = None
+    zone: Optional[str] = None
+    address: Optional[str] = None
+    location: Optional[GeoPoint] = None
+
+    # Public/static IP of the building's router or firewall, when it has one
+    # and it is relevant. NOT interchangeable with recorder_host or any
+    # camera's host (those are normally private addresses behind it).
+    public_ip: Optional[str] = None
+    connection_mode: CCTVConnectionMode = CCTVConnectionMode.nvr
+    network_access: CCTVNetworkAccess = CCTVNetworkAccess.vpn
+    # Admin-controlled, per-building SSRF authorization: CIDRs the backend and
+    # media gateway may connect to for THIS building's cameras (e.g. the VPN
+    # subnet the recorder lives on). Validated by
+    # cctv_security.parse_authorized_networks; the global allowlist and the
+    # permanently blocked ranges are unaffected.
+    authorized_networks: List[str] = Field(default_factory=list)
+
+    # NVR/DVR settings (connection_mode == nvr).
+    recorder_vendor: CCTVVendorPreset = CCTVVendorPreset.custom
+    recorder_protocol: CCTVStreamProtocol = CCTVStreamProtocol.rtsp
+    recorder_host: Optional[str] = None
+    recorder_port: int = 554
+    # Path template with an optional {channel} placeholder; empty for presets.
+    stream_path_template: Optional[str] = None
+    recorder_username: Optional[str] = None
+    recorder_encrypted_secret: Optional[str] = None  # Fernet ciphertext, never returned
+
+    enabled: bool = True
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+    created_by: Optional[uuid.UUID] = None
+    updated_by: Optional[uuid.UUID] = None
+
+    class Settings:
+        name = "cctv_buildings"
+        indexes = [
+            IndexModel([("code", ASCENDING)], unique=True),
+            IndexModel([("zone", ASCENDING)]),
+            IndexModel([("enabled", ASCENDING)]),
+            IndexModel([("name", ASCENDING)]),
             IndexModel([("location", "2dsphere")]),
         ]
 
@@ -902,6 +1018,14 @@ class PresenceEventSource(str, enum.Enum):
     controller = "PHYSICAL_CONTROLLER"
 
 
+class APRadio(BaseModel):
+    """One radio of an AP. A BSSID is per radio/SSID and is NOT the AP's management IP or a client MAC."""
+    band: Optional[str] = None  # "2.4GHz" | "5GHz" | "6GHz" (as the source reports it)
+    channel: Optional[int] = None
+    bssid: Optional[str] = None  # normalised aa:bb:cc:dd:ee:ff
+    ssid: Optional[str] = None
+
+
 class AccessPoint(Document):
     id: uuid.UUID = Field(default_factory=uuid.uuid4)
     code: str  # natural key, e.g. "AP-01"
@@ -945,6 +1069,22 @@ class AccessPoint(Document):
     retire_reason: Optional[str] = None
     config_history: List[APConfigChange] = Field(default_factory=list)
     is_demo: bool = False
+    # --- Generic-site placement (all optional; older APs simply have none of these) ---
+    site_id: Optional[uuid.UUID] = None
+    site_zone_id: Optional[uuid.UUID] = None  # SiteZone.id
+    site_building_id: Optional[uuid.UUID] = None
+    site_floor_id: Optional[uuid.UUID] = None
+    controller_id: Optional[uuid.UUID] = None
+    switch_id: Optional[uuid.UUID] = None
+    switch_port: Optional[str] = None
+    environment: str = "unknown"  # indoor | outdoor | unknown
+    radios: List[APRadio] = Field(default_factory=list)
+    ssids: List[str] = Field(default_factory=list)
+    plan_x: Optional[float] = None  # position on the floor plan, normalized 0..1
+    plan_y: Optional[float] = None
+    client_capacity: Optional[int] = None  # per-AP override of the site's AP thresholds
+    last_telemetry_state: str = "unknown"  # online | stale | offline (derived; availability history)
+    network_metadata: Optional[dict] = None
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
     created_by: Optional[uuid.UUID] = None
@@ -960,6 +1100,9 @@ class AccessPoint(Document):
                 unique=True,
                 partialFilterExpression={"serial_number": {"$type": "string"}},
             ),
+            IndexModel([("site_id", ASCENDING), ("site_zone_id", ASCENDING)]),
+            IndexModel([("site_id", ASCENDING), ("management_ip", ASCENDING)]),
+            IndexModel([("radios.bssid", ASCENDING)]),
             IndexModel([("lifecycle_status", ASCENDING)]),
             IndexModel([("verification_status", ASCENDING)]),
             IndexModel([("station_id", ASCENDING)]),
@@ -1231,6 +1374,515 @@ class EdgeControllerEventLog(Document):
         ]
 
 
+# ===========================================================================
+# Generic monitored sites and network telemetry (Network Hopping platform).
+#
+# Hierarchy:  Site -> Zone -> network infrastructure (APs, switches, controllers)
+# Optional:   Site -> Building -> Floor -> Zone   (buildings/floors are NEVER required;
+#             an open festival ground or outdoor campus uses zones only).
+#
+# Deliberately separate from the older police-presence models (AccessPoint is
+# extended additively; PolicePresence/PresenceHandoff are untouched) and from the
+# CCTV `Building` (SiteBuilding may reference it via cctv_building_id).
+# ===========================================================================
+
+class SiteType(str, enum.Enum):
+    campus = "campus"
+    building = "building"
+    mall = "mall"
+    hospital = "hospital"
+    transport_hub = "transport_hub"  # railway/bus station
+    airport = "airport"
+    stadium = "stadium"
+    convention_centre = "convention_centre"
+    festival = "festival"
+    outdoor_grounds = "outdoor_grounds"
+    industrial = "industrial"
+    custom = "custom"  # pair with MonitoredSite.custom_type_label
+
+
+class SiteMonitoringScope(str, enum.Enum):
+    """Which client devices may be tracked at all. `allowlist` is the default: nothing is tracked unless the site explicitly authorizes it."""
+    allowlist = "allowlist"  # only pseudonyms in SitePolicy.allowlist
+    all_clients = "all_clients_pseudonymized"  # every client, pseudonymized; requires an authorization reference
+
+
+class SitePolicy(BaseModel):
+    scope_mode: SiteMonitoringScope = SiteMonitoringScope.allowlist
+    authorization_reference: Optional[str] = None  # who/what authorizes monitoring (required for all_clients)
+    retention_days: int = 30
+    # Raw client identifiers are NOT stored unless this is on AND CLIENT_RAW_ID_KEY is configured.
+    store_raw_identifiers: bool = False
+    allowlist: List[str] = Field(default_factory=list)  # client PSEUDONYMS (never raw identifiers)
+
+
+class MonitoredSite(Document):
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    code: str
+    name: str
+    site_type: SiteType = SiteType.custom
+    custom_type_label: Optional[str] = None
+    organization: Optional[str] = None  # tenant label; there is no Organization collection in this architecture
+    description: Optional[str] = None
+    address: Optional[str] = None
+    location: Optional[GeoPoint] = None
+    boundary: Optional[GeoPolygon] = None
+    timezone: str = "UTC"
+    active: bool = True
+    # `restricted` sites are visible to admins and to the control_room users in viewer_user_ids only.
+    access_mode: str = "all_control_room"
+    viewer_user_ids: List[uuid.UUID] = Field(default_factory=list)
+    policy: SitePolicy = Field(default_factory=SitePolicy)
+    # Per-AP load thresholds (active clients). Zones carry their own thresholds.
+    ap_warning_clients: Optional[int] = None
+    ap_critical_clients: Optional[int] = None
+    metadata: Optional[dict] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+    created_by: Optional[uuid.UUID] = None
+    updated_by: Optional[uuid.UUID] = None
+
+    class Settings:
+        name = "monitored_sites"
+        indexes = [
+            IndexModel([("code", ASCENDING)], unique=True),
+            IndexModel([("active", ASCENDING)]),
+            IndexModel([("organization", ASCENDING)]),
+            IndexModel([("location", "2dsphere")]),
+        ]
+
+
+class SiteBuilding(Document):
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    site_id: uuid.UUID
+    code: str
+    name: str
+    description: Optional[str] = None
+    cctv_building_id: Optional[uuid.UUID] = None  # optional link to the CCTV Building; no duplication of its data
+    location: Optional[GeoPoint] = None
+    metadata: Optional[dict] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "site_buildings"
+        indexes = [IndexModel([("site_id", ASCENDING), ("code", ASCENDING)], unique=True)]
+
+
+class SiteFloor(Document):
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    site_id: uuid.UUID
+    building_id: Optional[uuid.UUID] = None
+    code: str
+    name: str
+    level: Optional[int] = None  # display ordering / 3D stacking (basements negative)
+    height_m: Optional[float] = None  # storey height, used only for the layered view
+    plan_storage_key: Optional[str] = None  # floor-plan image in the evidence storage backend
+    plan_mime: Optional[str] = None
+    plan_width_px: Optional[int] = None
+    plan_height_px: Optional[int] = None
+    plan_meters_per_pixel: Optional[float] = None
+    display_order: int = 0
+    metadata: Optional[dict] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "site_floors"
+        indexes = [
+            IndexModel([("site_id", ASCENDING), ("code", ASCENDING)], unique=True),
+            IndexModel([("site_id", ASCENDING), ("building_id", ASCENDING), ("display_order", ASCENDING)]),
+        ]
+
+
+class SiteZone(Document):
+    """Indoor and outdoor zones alike. A zone needs neither a floor nor coordinates; give it a geographic boundary, a floor-plan polygon, both, or neither."""
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    site_id: uuid.UUID
+    code: str
+    name: str
+    zone_type: str = "general"  # free text: custom zone types are allowed
+    description: Optional[str] = None
+    building_id: Optional[uuid.UUID] = None
+    floor_id: Optional[uuid.UUID] = None
+    boundary: Optional[GeoPolygon] = None  # WGS84 [lon, lat]
+    plan_polygon: Optional[List[List[float]]] = None  # [[x, y], ...] normalized 0..1 on the floor plan
+    capacity: Optional[int] = None
+    warning_threshold: Optional[int] = None  # active clients
+    critical_threshold: Optional[int] = None
+    active: bool = True
+    display_order: int = 0
+    metadata: Optional[dict] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "site_zones"
+        indexes = [
+            IndexModel([("site_id", ASCENDING), ("code", ASCENDING)], unique=True),
+            IndexModel([("site_id", ASCENDING), ("floor_id", ASCENDING)]),
+            IndexModel([("boundary", "2dsphere")]),
+        ]
+
+
+class SwitchPort(BaseModel):
+    port: str  # as the switch labels it, e.g. "Gi1/0/12"
+    description: Optional[str] = None
+    ap_id: Optional[uuid.UUID] = None
+    vlan: Optional[int] = None
+    link_status: str = "unknown"  # up | down | unknown (only set when a source reports it)
+    last_seen_at: Optional[datetime] = None
+
+
+class NetworkSwitch(Document):
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    site_id: uuid.UUID
+    code: str
+    name: str
+    management_ip: Optional[str] = None
+    vendor: Optional[str] = None
+    model: Optional[str] = None
+    serial_number: Optional[str] = None
+    building_id: Optional[uuid.UUID] = None
+    floor_id: Optional[uuid.UUID] = None
+    ports: List[SwitchPort] = Field(default_factory=list)
+    active: bool = True
+    last_seen_at: Optional[datetime] = None  # only ever set by a real telemetry source
+    metadata: Optional[dict] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "network_switches"
+        indexes = [IndexModel([("site_id", ASCENDING), ("code", ASCENDING)], unique=True)]
+
+
+class NetworkController(Document):
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    site_id: uuid.UUID
+    code: str
+    name: str
+    vendor: Optional[str] = None
+    model: Optional[str] = None
+    management_ip: Optional[str] = None
+    adapter_kind: Optional[str] = None
+    active: bool = True
+    health: str = "unknown"  # unknown | healthy | degraded | error (reported by a collector)
+    last_seen_at: Optional[datetime] = None
+    metadata: Optional[dict] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "network_controllers"
+        indexes = [IndexModel([("site_id", ASCENDING), ("code", ASCENDING)], unique=True)]
+
+
+class Collector(Document):
+    """A site's LAN collector. It authenticates with its OWN credential, which is bound to exactly one site; the site is never taken from a request body."""
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    site_id: uuid.UUID
+    code: str
+    name: str
+    adapter_kind: str = "synthetic"
+    is_simulated: bool = False  # server-side truth: everything this collector sends is labelled SYNTHETIC
+    # Credential: only a SHA-256 of the secret part is stored. The token is shown once on create/rotate.
+    token_hash: Optional[str] = None
+    token_hint: Optional[str] = None  # last 4 characters, to tell tokens apart in the UI
+    token_version: int = 1
+    previous_token_hash: Optional[str] = None  # still accepted until previous_valid_until (rolling rotation)
+    previous_valid_until: Optional[datetime] = None
+    revoked: bool = False
+    active: bool = True
+    capabilities: List[str] = Field(default_factory=list)
+    adapter_health: Optional[dict] = None
+    version: Optional[str] = None
+    buffer_depth: int = 0
+    dropped_events: int = 0
+    last_seen_at: Optional[datetime] = None  # last heartbeat or ingest
+    last_ingest_at: Optional[datetime] = None
+    last_state: str = "unknown"  # online | stale | offline (derived, for availability history)
+    config: Optional[dict] = None  # non-secret operational config only
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+    created_by: Optional[uuid.UUID] = None
+
+    class Settings:
+        name = "network_collectors"
+        indexes = [IndexModel([("site_id", ASCENDING), ("code", ASCENDING)], unique=True)]
+
+
+class ClientAssociation(Document):
+    """
+    CURRENT association state, one document per (site, client pseudonym).
+    History lives in NetworkEvent; this row is only ever changed by
+    services/site_events.py using a version-guarded compare-and-set.
+    `state == "active"` rows are the ONLY thing counted as connected clients.
+    """
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    site_id: uuid.UUID
+    client_pseudonym: str
+    state: str = "closed"  # active | closed
+    ap_id: Optional[uuid.UUID] = None
+    ap_ref: Optional[str] = None  # the source's identifier for the AP (BSSID etc.)
+    radio_bssid: Optional[str] = None
+    zone_id: Optional[uuid.UUID] = None
+    floor_id: Optional[uuid.UUID] = None
+    building_id: Optional[uuid.UUID] = None
+    source: str = "REAL"  # REAL | SYNTHETIC | SNAPSHOT
+    associated_at: Optional[datetime] = None
+    last_event_at: Optional[datetime] = None  # SOURCE timestamp of the event that last set this state
+    last_event_key: Optional[str] = None  # "<collector>:<event id>" of that event (tie-break)
+    last_seq: Optional[int] = None
+    seq_stream: Optional[str] = None
+    ordering_confidence: str = "timestamp"  # sequence | timestamp | tie_break | snapshot
+    previous_ap_id: Optional[uuid.UUID] = None
+    closed_at: Optional[datetime] = None
+    close_reason: Optional[str] = None
+    raw_identifier_encrypted: Optional[str] = None  # only when the site policy and key allow it
+    version: int = 0
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "client_associations"
+        indexes = [
+            IndexModel([("site_id", ASCENDING), ("client_pseudonym", ASCENDING)], unique=True),
+            IndexModel([("site_id", ASCENDING), ("state", ASCENDING), ("ap_id", ASCENDING)]),
+            IndexModel([("site_id", ASCENDING), ("state", ASCENDING), ("zone_id", ASCENDING)]),
+            IndexModel([("site_id", ASCENDING), ("state", ASCENDING), ("floor_id", ASCENDING)]),
+            IndexModel([("state", ASCENDING), ("updated_at", ASCENDING)]),
+        ]
+
+
+class NetworkEvent(Document):
+    """Append-only history of every accepted ingest event, including ones that did not change state (outcome says why)."""
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    site_id: uuid.UUID
+    collector_id: uuid.UUID
+    event_id: str  # unique per collector: the idempotency key
+    event_type: str  # association | disassociation | roam
+    client_pseudonym: str
+    ap_id: Optional[uuid.UUID] = None
+    ap_ref: Optional[str] = None
+    from_ap_id: Optional[uuid.UUID] = None
+    radio_bssid: Optional[str] = None
+    zone_id: Optional[uuid.UUID] = None
+    source_timestamp: datetime
+    received_at: datetime = Field(default_factory=_utcnow)
+    source_seq: Optional[int] = None
+    seq_stream: Optional[str] = None
+    session_id: Optional[str] = None
+    source: str = "REAL"
+    # received (not yet processed) | applied | stale | duplicate_state | ap_mismatch | no_active | unknown_ap | out_of_scope | uncertain
+    outcome: str = "received"
+    outcome_detail: Optional[str] = None
+    ordering_confidence: Optional[str] = None
+
+    class Settings:
+        name = "network_events"
+        indexes = [
+            IndexModel([("collector_id", ASCENDING), ("event_id", ASCENDING)], unique=True),
+            IndexModel([("site_id", ASCENDING), ("source_timestamp", -1)]),
+            IndexModel([("site_id", ASCENDING), ("event_type", ASCENDING), ("source_timestamp", -1)]),
+            IndexModel([("client_pseudonym", ASCENDING), ("source_timestamp", -1)]),
+            IndexModel([("received_at", ASCENDING)]),
+        ]
+
+
+class OccupancySample(Document):
+    """Per-minute (or coarser) time series of ACTIVE CLIENT ASSOCIATIONS for a site, zone, AP or floor. Not a head count of people."""
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    site_id: uuid.UUID
+    scope: str  # site | zone | ap | floor
+    scope_id: Optional[uuid.UUID] = None
+    bucket_start: datetime
+    active_clients: int = 0  # last value seen in the bucket
+    peak_clients: int = 0
+    samples: int = 0
+    quality: str = "none"  # live | simulated | mixed | snapshot | stale | none
+    simulated: bool = False
+
+    class Settings:
+        name = "occupancy_samples"
+        indexes = [
+            IndexModel([("site_id", ASCENDING), ("scope", ASCENDING), ("scope_id", ASCENDING), ("bucket_start", ASCENDING)], unique=True),
+            IndexModel([("site_id", ASCENDING), ("bucket_start", -1)]),
+        ]
+
+
+class ThresholdBreach(Document):
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    site_id: uuid.UUID
+    scope: str  # zone | ap
+    scope_id: uuid.UUID
+    level: str  # warning | critical
+    threshold: int
+    peak_clients: int
+    started_at: datetime = Field(default_factory=_utcnow)
+    last_seen_at: datetime = Field(default_factory=_utcnow)
+    ended_at: Optional[datetime] = None
+    active: bool = True
+
+    class Settings:
+        name = "threshold_breaches"
+        indexes = [
+            IndexModel([("site_id", ASCENDING), ("started_at", -1)]),
+            # at most ONE open breach per entity
+            IndexModel(
+                [("site_id", ASCENDING), ("scope", ASCENDING), ("scope_id", ASCENDING)],
+                unique=True, partialFilterExpression={"active": True},
+            ),
+        ]
+
+
+class AvailabilityEvent(Document):
+    """State changes of collectors/APs/controllers, for availability and stale-telemetry history."""
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    site_id: uuid.UUID
+    entity_type: str  # collector | ap | controller
+    entity_id: uuid.UUID
+    state: str  # online | stale | offline
+    at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "availability_events"
+        indexes = [
+            IndexModel([("site_id", ASCENDING), ("at", -1)]),
+            IndexModel([("entity_type", ASCENDING), ("entity_id", ASCENDING), ("at", -1)]),
+        ]
+
+
+# ===========================================================================
+# Bodycam <-> site (Network Hopping) offline video transport.
+#
+# Identity chain: Organization(label) -> MonitoredSite -> SiteAssignment (officer)
+#                 -> DeviceSiteAuthorization (phone) -> OfflineGrant (signed, short-lived)
+#                 -> RecordingSession (client UUID) -> Chunk (client UUID + SHA-256)
+# A SiteReceiver is the LAN service that accepts chunks while the control room is
+# unreachable and forwards them later; it authenticates to the control room with its
+# OWN credential (never an officer login).
+# ===========================================================================
+
+class SiteAssignment(Document):
+    """An officer's assignment to a monitored site (and optionally a zone/building/floor). NOT the legacy Constable.assigned_zone_code."""
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    site_id: uuid.UUID
+    constable_id: uuid.UUID
+    zone_id: Optional[uuid.UUID] = None
+    building_id: Optional[uuid.UUID] = None
+    floor_id: Optional[uuid.UUID] = None
+    status: str = "active"  # active | revoked
+    valid_from: datetime = Field(default_factory=_utcnow)
+    valid_until: Optional[datetime] = None
+    notes: Optional[str] = None
+    created_by: Optional[uuid.UUID] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    revoked_at: Optional[datetime] = None
+    revoked_reason: Optional[str] = None
+
+    class Settings:
+        name = "site_assignments"
+        indexes = [
+            IndexModel([("site_id", ASCENDING), ("status", ASCENDING)]),
+            IndexModel([("constable_id", ASCENDING), ("status", ASCENDING)]),
+            IndexModel([("site_id", ASCENDING), ("constable_id", ASCENDING)], unique=True, partialFilterExpression={"status": "active"}, name="uq_active_assignment_per_site_officer"),
+        ]
+
+
+class DeviceSiteAuthorization(Document):
+    """A registered phone is allowed to operate at a site. Revocation is explicit and keeps history."""
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    site_id: uuid.UUID
+    device_id: uuid.UUID
+    constable_id: uuid.UUID
+    status: str = "authorized"  # authorized | revoked
+    authorized_by: Optional[uuid.UUID] = None
+    authorized_at: datetime = Field(default_factory=_utcnow)
+    valid_until: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+    revoked_reason: Optional[str] = None
+
+    class Settings:
+        name = "device_site_authorizations"
+        indexes = [
+            IndexModel([("site_id", ASCENDING), ("status", ASCENDING)]),
+            IndexModel([("device_id", ASCENDING), ("status", ASCENDING)]),
+            IndexModel([("site_id", ASCENDING), ("device_id", ASCENDING)], unique=True, partialFilterExpression={"status": "authorized"}, name="uq_active_device_site"),
+        ]
+
+
+class OfflineGrant(Document):
+    """Server-side record of a signed offline grant (the JWT itself is NOT stored). Used for listing, revocation and revocation propagation."""
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)  # also the JWT `jti`
+    site_id: uuid.UUID
+    constable_id: uuid.UUID
+    device_id: uuid.UUID
+    assignment_id: Optional[uuid.UUID] = None
+    key_id: Optional[str] = None
+    operations: List[str] = Field(default_factory=list)
+    issued_at: datetime = Field(default_factory=_utcnow)
+    expires_at: datetime
+    issued_by: Optional[uuid.UUID] = None  # None = self-service renewal by the officer's own authenticated phone
+    revoked: bool = False
+    revoked_at: Optional[datetime] = None
+    revoked_reason: Optional[str] = None
+
+    class Settings:
+        name = "offline_grants"
+        indexes = [
+            IndexModel([("site_id", ASCENDING), ("revoked", ASCENDING), ("expires_at", -1)]),
+            IndexModel([("device_id", ASCENDING), ("issued_at", -1)]),
+            IndexModel([("constable_id", ASCENDING), ("issued_at", -1)]),
+        ]
+
+
+class SiteReceiver(Document):
+    """A site's local video receiver. Authenticates to the control room with its own credential (hash stored, shown once)."""
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    site_id: uuid.UUID
+    code: str
+    name: str
+    endpoint_url: Optional[str] = None  # the URL PHONES use on the site LAN/Wi-Fi (never a public default)
+    local_live_enabled: bool = False
+    local_live_url: Optional[str] = None  # site-local LiveKit, when deployed
+    active: bool = True
+    revoked: bool = False
+    token_hash: Optional[str] = None
+    token_hint: Optional[str] = None
+    token_version: int = 1
+    previous_token_hash: Optional[str] = None
+    previous_valid_until: Optional[datetime] = None
+    version: Optional[str] = None
+    capabilities: List[str] = Field(default_factory=list)
+    last_seen_at: Optional[datetime] = None
+    last_sync_at: Optional[datetime] = None
+    last_central_ack_at: Optional[datetime] = None  # last time the receiver reported a successful central acknowledgement
+    last_local_upload_at: Optional[datetime] = None
+    # Latest self-reported health (heartbeat).
+    disk_total_bytes: Optional[int] = None
+    disk_free_bytes: Optional[int] = None
+    min_free_bytes: Optional[int] = None
+    accepting_uploads: Optional[bool] = None
+    pending_chunks: int = 0
+    syncing_chunks: int = 0
+    quarantined_chunks: int = 0
+    received_chunks_total: int = 0
+    central_reachable: Optional[bool] = None
+    recent_devices: Dict[str, str] = Field(default_factory=dict)  # device identifier -> ISO time last seen by the receiver
+    failures: List[dict] = Field(default_factory=list)  # newest sync failures (bounded), for the dashboard
+    pending_commands: List[dict] = Field(default_factory=list)  # {id, type, args, created_at}; delivered on the next sync
+    local_recordings: List[dict] = Field(default_factory=list)  # latest bounded summary of recordings the receiver still holds
+    local_recordings_at: Optional[datetime] = None
+    config: Optional[dict] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+    created_by: Optional[uuid.UUID] = None
+
+    class Settings:
+        name = "site_receivers"
+        indexes = [IndexModel([("site_id", ASCENDING), ("code", ASCENDING)], unique=True)]
+
+
 DOCUMENT_MODELS = [
     User,
     PoliceStation,
@@ -1246,6 +1898,7 @@ DOCUMENT_MODELS = [
     RemoteCommand,
     LiveStreamSession,
     CCTVCamera,
+    Building,
     CCTVStreamSession,
     AccessPoint,
     PolicePresence,
@@ -1253,7 +1906,23 @@ DOCUMENT_MODELS = [
     Deployment,
     EventZone,
     EdgeControllerEventLog,
+    MonitoredSite,
+    SiteBuilding,
+    SiteFloor,
+    SiteZone,
+    NetworkSwitch,
+    NetworkController,
+    Collector,
+    ClientAssociation,
+    NetworkEvent,
+    OccupancySample,
+    ThresholdBreach,
+    AvailabilityEvent,
     DutySession,
     LocationIngestKey,
+    SiteAssignment,
+    DeviceSiteAuthorization,
+    OfflineGrant,
+    SiteReceiver,
 ]
 

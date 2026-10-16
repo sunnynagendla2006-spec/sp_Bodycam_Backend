@@ -401,9 +401,23 @@ def _recording_summary(session: models.RecordingSession) -> dict:
     }
 
 
+async def _to_control_room_for_recording(session: models.RecordingSession, event: dict):
+    """Recording events of a SITE recording reach only the control-room users who may view that site (restricted sites
+    included), the same policy as the REST endpoints. Recordings without a site keep the original broadcast."""
+    from . import site_access  # imported here, as elsewhere in this module, to avoid an import cycle
+
+    site_id = getattr(session, "site_id", None)
+    if site_id is not None:
+        site = await models.MonitoredSite.get(site_id)
+        if site is not None:
+            await manager.send_to_control_room_where(event, site_access.ws_predicate(site))
+            return
+    await manager.send_to_control_room(event)
+
+
 async def publish_recording_started(session: models.RecordingSession, station_id: Optional[uuid.UUID]):
     event = build_event("recording.started", _recording_summary(session))
-    await manager.send_to_control_room(event)
+    await _to_control_room_for_recording(session, event)
     await manager.send_to_station(station_id, event)
     await manager.send_to_constable(session.constable_id, event)
 
@@ -413,7 +427,7 @@ async def publish_recording_chunk_uploaded(session: models.RecordingSession, sta
     payload["chunk_number"] = chunk_number
     payload["is_last_chunk"] = is_last_chunk
     event = build_event("recording.chunk_uploaded", payload)
-    await manager.send_to_control_room(event)
+    await _to_control_room_for_recording(session, event)
     await manager.send_to_station(station_id, event)
     await manager.send_to_constable(session.constable_id, event)
 
@@ -422,14 +436,14 @@ async def publish_recording_completed(session: models.RecordingSession, station_
     payload = _recording_summary(session)
     payload["missing_chunk_numbers"] = missing_chunk_numbers
     event = build_event("recording.completed", payload)
-    await manager.send_to_control_room(event)
+    await _to_control_room_for_recording(session, event)
     await manager.send_to_station(station_id, event)
     await manager.send_to_constable(session.constable_id, event)
 
 
 async def publish_recording_cancelled(session: models.RecordingSession, station_id: Optional[uuid.UUID]):
     event = build_event("recording.cancelled", _recording_summary(session))
-    await manager.send_to_control_room(event)
+    await _to_control_room_for_recording(session, event)
     await manager.send_to_station(station_id, event)
     await manager.send_to_constable(session.constable_id, event)
 
@@ -439,7 +453,7 @@ async def publish_recording_failed(session: models.RecordingSession, station_id:
     if reason:
         payload["reason"] = reason
     event = build_event("recording.failed", payload)
-    await manager.send_to_control_room(event)
+    await _to_control_room_for_recording(session, event)
     await manager.send_to_station(station_id, event)
     await manager.send_to_constable(session.constable_id, event)
 
@@ -554,6 +568,7 @@ def _cctv_camera_summary(camera: models.CCTVCamera) -> dict:
         "station_id": str(camera.station_id) if camera.station_id else None,
         "enabled": camera.enabled,
         "status": camera.status.value if camera.status else None,
+        "building_id": str(camera.building_id) if camera.building_id else None,
     }
 
 
@@ -713,3 +728,51 @@ async def publish_zone_emergency_alert(
     await manager.send_to_control_room(build_event("zone.emergency_alert", payload))
     for constable_id in targeted_constable_ids:
         await manager.send_to_constable(constable_id, build_event("zone.emergency_alert", {"zone": zone, "message": message}))
+
+
+# ---------------------------------------------------------------------------
+# CCTV buildings. Same audience and no-secrets rule as the camera events above:
+# control_room room only, and payloads never carry hosts, IPs or credentials.
+# ---------------------------------------------------------------------------
+
+async def publish_cctv_building_changed(building: models.Building, kind: str):
+    """kind: created | updated | enabled | disabled | deleted"""
+    await manager.send_to_control_room(build_event(f"cctv.building_{kind}", {
+        "building_id": str(building.id), "code": building.code, "name": building.name,
+        "zone": building.zone, "enabled": building.enabled,
+    }))
+
+
+async def publish_cctv_building_health(building_id: uuid.UUID, health: str, counts: dict):
+    await manager.send_to_control_room(build_event("cctv.building_health", {
+        "building_id": str(building_id), "health": health, **counts,
+    }))
+
+
+# ---------------------------------------------------------------------------
+# Network monitoring (generic sites). Site-scoped: delivered only to the
+# control-room users allowed to open that site (services/site_access.py), and
+# AGGREGATE ONLY -- no client pseudonym, MAC or per-client detail is ever put
+# on the WebSocket.
+# ---------------------------------------------------------------------------
+
+async def _publish_site_event(site: models.MonitoredSite, name: str, payload: dict):
+    from . import site_access
+
+    await manager.send_to_control_room_where(build_event(name, {"site_id": str(site.id), "site_code": site.code, **payload}), site_access.ws_predicate(site))
+
+
+async def publish_network_counts(site: models.MonitoredSite, payload: dict):
+    await _publish_site_event(site, "network.counts", payload)
+
+
+async def publish_network_roam(site: models.MonitoredSite, payload: dict):
+    await _publish_site_event(site, "network.roam", payload)
+
+
+async def publish_network_breach(site: models.MonitoredSite, payload: dict):
+    await _publish_site_event(site, "network.breach", payload)
+
+
+async def publish_network_health(site: models.MonitoredSite, payload: dict):
+    await _publish_site_event(site, "network.health", payload)

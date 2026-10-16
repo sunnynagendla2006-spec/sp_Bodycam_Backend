@@ -354,7 +354,12 @@ async def process_edge_telemetry_event(
     # 5. Handle Disassociation
     if event.event_type == schemas.EdgeAPEventType.disassociation:
         presence = await models.PolicePresence.find_one(models.PolicePresence.device_id == device.id)
-        if presence and presence.current_access_point_id == access_point.id:
+        stale_disassoc = bool(
+            presence and presence.last_seen_at is not None
+            and (event.occurred_at if event.occurred_at.tzinfo else event.occurred_at.replace(tzinfo=datetime.timezone.utc))
+            < (presence.last_seen_at if presence.last_seen_at.tzinfo else presence.last_seen_at.replace(tzinfo=datetime.timezone.utc))
+        )
+        if presence and presence.current_access_point_id == access_point.id and not stale_disassoc:
             old_status = presence.status.value if presence.status else None
             presence.status = models.PresenceConnectionStatus.disconnected
             presence.last_seen_at = event.occurred_at
@@ -421,7 +426,7 @@ async def process_edge_telemetry_event(
         event_type=event.event_type.value,
         occurred_at=event.occurred_at,
         server_received_at=now,
-        status="accepted" if not result.duplicate_event else "duplicate_ignored",
+        status="stale_ignored" if result.stale_event else ("accepted" if not result.duplicate_event else "duplicate_ignored"),
         details={
             "rssi_dbm": event.rssi_dbm,
             "handoff_created": result.handoff_created,
@@ -443,7 +448,7 @@ async def process_edge_telemetry_event(
             from_ap = await models.AccessPoint.get(result.handoff.previous_access_point_id)
         await events.publish_presence_handoff(result.presence, result.handoff, from_ap, access_point, station_id)
 
-    status_str = "duplicate_ignored" if result.duplicate_event else "accepted"
+    status_str = "stale_ignored" if result.stale_event else ("duplicate_ignored" if result.duplicate_event else "accepted")
     return schemas.EdgeAPTelemetryResponse(
         status=status_str,
         event_id=event.controller_event_id,
@@ -451,5 +456,5 @@ async def process_edge_telemetry_event(
         handoff_created=result.handoff_created,
         device_identifier=device.device_identifier,
         access_point_code=access_point.code,
-        message="Handoff recorded" if result.handoff_created else "Association recorded",
+        message="Older than the state already held; not applied" if result.stale_event else ("Handoff recorded" if result.handoff_created else "Association recorded"),
     )

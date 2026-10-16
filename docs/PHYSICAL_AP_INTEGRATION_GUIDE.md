@@ -1,4 +1,10 @@
 # ARVI-SENTINELS — Physical Access Point Integration Guide
+
+> **Correction / update:** the forwarder shown in section 4 is only an illustrative snippet; `scripts/edge_syslog_forwarder.py`
+> does **not** exist in this repository. The supported route for real telemetry is the standalone collector
+> (`backend/collector`) feeding the per-collector API described in [NETWORK_MONITORING_PLATFORM.md](NETWORK_MONITORING_PLATFORM.md).
+> No production vendor adapter exists yet. The tests labelled "verified programmatically" below were not re-verified.
+
 **Wireless Telemetry Ingestion, Controller Configuration & Field Acceptance Testing**
 **Andhra Pradesh Police Department | Jathara & Public Event Communications**
 
